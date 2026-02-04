@@ -45,6 +45,7 @@ eos             = ideal  # EOS type
 reconstruct     = ppm4   # spatial reconstruction method
 rsolver         = hlld   # Riemann-solver to be used
 gamma           = 1.4    # gamma = C_p/C_v
+const_accel_val = -0.1   # for pgen initial pressure profile
 
 <mhd_srcterms>
 const_accel     = true   # add constant accleration source term

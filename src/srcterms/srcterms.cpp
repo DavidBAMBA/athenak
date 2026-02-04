@@ -105,7 +105,8 @@ void SourceTerms::ApplySrcTerms(DvceArray5D<Real> &i0, const Real bdt) {
 //----------------------------------------------------------------------------------------
 //! \fn SourceTerms::ConstantAccel
 //! \brief Add constant acceleration
-//! NOTE source terms must be computed using primitive (w0) and NOT conserved (u0) vars
+//! NOTE: For non-relativistic MHD/Hydro, uses primitive density (w0).
+//!       For special relativistic MHD/Hydro, uses conserved density D = rho*gamma (u0).
 
 void SourceTerms::ConstantAccel(const DvceArray5D<Real> &w0, const EOS_Data &eos_data,
                                 const Real bdt, DvceArray5D<Real> &u0) {
@@ -118,12 +119,33 @@ void SourceTerms::ConstantAccel(const DvceArray5D<Real> &w0, const EOS_Data &eos
   Real &g = const_accel_val;
   int &dir = const_accel_dir;
 
-  par_for("const_acc", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
-  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-    Real src = bdt*g*w0(m,IDN,k,j,i);
-    u0(m,dir,k,j,i) += src;
-    if (eos_data.is_ideal) { u0(m,IEN,k,j,i) += src*w0(m,dir,k,j,i); }
-  });
+  // Check if special relativistic - need to use conserved density D = rho*gamma
+  bool is_sr = pmy_pack->pcoord->is_special_relativistic;
+
+  if (is_sr) {
+    // SRMHD: use conserved density D = rho * gamma (stored in u0(IDN))
+    // Source term for momentum: dS/dt = D * g
+    // Source term for energy: d(tau)/dt = S_i * g^i (work done by gravity)
+    par_for("const_acc_sr", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      Real D = u0(m,IDN,k,j,i);  // conserved density D = rho * gamma
+      Real S_dir = u0(m,dir,k,j,i);  // momentum in gravity direction (before update)
+      Real src = bdt*g*D;
+      u0(m,dir,k,j,i) += src;
+      // Energy source: dτ/dt = S_i * g^i
+      if (eos_data.is_ideal) {
+        u0(m,IEN,k,j,i) += bdt*g*S_dir;
+      }
+    });
+  } else {
+    // Non-relativistic: use primitive density rho
+    par_for("const_acc", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      Real src = bdt*g*w0(m,IDN,k,j,i);
+      u0(m,dir,k,j,i) += src;
+      if (eos_data.is_ideal) { u0(m,IEN,k,j,i) += src*w0(m,dir,k,j,i); }
+    });
+  }
 
   return;
 }

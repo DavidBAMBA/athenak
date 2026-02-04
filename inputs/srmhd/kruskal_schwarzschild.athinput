@@ -1,0 +1,81 @@
+# AthenaK input file for SR MHD Kruskal-Schwarzschild instability
+# Adapted from Athena-C 2Dks.c and Athena++ 2dksi.cpp
+#
+
+<comment>
+problem   = 2D Kruskal-Schwarzschild instability in relativistic MHD
+reference = Kruskal & Schwarzschild 1954, Proc. R. Soc. London A 223, 348
+configure = -D PROBLEM=kruskal_schwarzschild -D RSOLVER=hlle -D EOS=ideal
+
+<job>
+basename  = 2dksi      # problem ID: basename of output filenames
+
+<mesh>
+nghost    = 3
+nx1       = 512         # Number of zones in X1-direction
+x1min     = -0.05       # minimum value of X1
+x1max     = 0.05        # maximum value of X1
+ix1_bc    = periodic    # Inner-X1 boundary condition flag
+ox1_bc    = periodic    # Outer-X1 boundary condition flag
+
+nx2       = 1024         # Number of zones in X2-direction
+x2min     = -0.1        # minimum value of X2
+x2max     = 0.1         # maximum value of X2
+ix2_bc    = outflow     # Inner-X2 boundary condition flag
+ox2_bc    = outflow     # Outer-X2 boundary condition flag
+
+nx3       = 1           # Number of zones in X3-direction
+x3min     = -0.05       # minimum value of X3
+x3max     = 0.05        # maximum value of X3
+ix3_bc    = periodic    # Inner-X3 boundary condition flag
+ox3_bc    = periodic    # Outer-X3 boundary condition flag
+
+<meshblock>
+nx1       = 64          # Number of cells in each MeshBlock, X1-dir
+nx2       = 64          # Number of cells in each MeshBlock, X2-dir
+nx3       = 1           # Number of cells in each MeshBlock, X3-dir
+
+<coord>
+special_rel = true      # Enable special relativistic MHD
+
+<time>
+evolution   = dynamic   # dynamic/kinematic/static
+integrator  = rk2       # time integration algorithm (vl2 equivalent)
+cfl_number  = 0.4       # The Courant, Friedrichs, & Lewy (CFL) Number
+nlim        = -1        # cycle limit (-1 = unlimited)
+tlim        = 10.0      # time limit
+ndiag       = 1       # cycles between diagnostic output
+
+<mhd>
+eos         = ideal
+reconstruct = plm       # 2nd order reconstruction
+rsolver     = hlle      # HLLE Riemann solver (hlld not available for SR)
+gamma       = 1.333333333333  # ratio of specific heats (4/3 for relativistic gas)
+dfloor      = 1.0e-10
+pfloor      = 1.0e-10
+
+<mhd_srcterms>
+# Gravity source terms
+# Athena-C convention: grav_pot = 0.1*x2 -> g = -dPhi/dy = -0.1
+const_accel     = true    # Enable constant acceleration (gravity)
+const_accel_val = -0.1    # g = -0.1 (negative = downward in x2)
+const_accel_dir = 2       # Direction of gravity (2 = x2-direction)
+
+<problem>
+pgen_name  = kruskal_schwarzschild
+amp        = 9.5346e-7  # velocity perturbation amplitude (same as Athena++)
+sigma      = 10.0       # magnetization parameter (B^2/rho)
+delta      = 0.01       # width of the hot central layer
+nx         = 1          # x-mode number for perturbation
+ny         = 1          # y-mode number for perturbation
+drat       = 3.0        # density ratio (hot layer / cold layer)
+
+<output1>
+file_type   = hst       # History data dump
+data_format = %12.5e    # Optional data format string
+dt          = 0.01      # time increment between outputs
+
+<output2>
+file_type   = vtk       # VTK output
+variable    = mhd_w_bcc # primitives + cell-centered B
+dt          = 0.01      # time increment between outputs
