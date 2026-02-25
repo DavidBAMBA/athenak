@@ -1,0 +1,92 @@
+# Athena++ (Kokkos version) input file for the Kruskal-Schwarzschild Instability
+# Ported from Athena++ 2dksi.cpp for GPU execution via AthenaK.
+#
+# Physics: Special relativistic MHD with effective gravity in -x2 direction.
+# In the rest frame of a relativistic jet slab, frame acceleration produces
+# an effective gravity that drives buoyancy-driven interchange modes
+# (analogous to Rayleigh-Taylor) in a reversed-field current sheet.
+#
+# Equilibrium:
+#   B3 = -b0*tanh(x2/a),  rho = 1 + 2*sech^2(x2/a),  p = p0*sech^2(x2/a)
+#   with b0 = sqrt(sigma), p0 = b0^2/2 (total pressure balance everywhere)
+#
+# Reference: Adapted from Athena-C KSI.c
+
+<comment>
+problem   = 2D Kruskal-Schwarzschild instability in special relativistic MHD
+reference = Adapted from Athena-C KSI.c / Athena++ 2dksi.cpp
+configure = -D PROBLEM=ksi
+
+<job>
+basename  = ksi            # problem ID: basename of output filenames
+
+<mesh>
+nghost    = 4              # number of ghost cells (ppmx needs 4)
+
+nx1       = 1024            # number of zones in X1 (horizontal)
+x1min     = -0.05          # minimum value of X1
+x1max     =  0.05          # maximum value of X1
+ix1_bc    = periodic       # inner-X1 boundary: periodic
+ox1_bc    = periodic       # outer-X1 boundary: periodic
+
+nx2       = 2048           # number of zones in X2 (transverse, 2:1 aspect ratio)
+x2min     = -0.1           # minimum value of X2
+x2max     =  0.1           # maximum value of X2
+ix2_bc    = user           # inner-X2 boundary: reflecting + hydrostatic correction
+ox2_bc    = user           # outer-X2 boundary: reflecting + hydrostatic correction
+
+nx3       = 1              # number of zones in X3 (1 = 2D)
+x3min     = -0.05          # minimum value of X3
+x3max     =  0.05          # maximum value of X3
+ix3_bc    = periodic       # inner-X3 boundary: periodic
+ox3_bc    = periodic       # outer-X3 boundary: periodic
+
+<meshblock>
+nx1       = 64             # cells per MeshBlock in X1 (64x64 for GPU occupancy)
+nx2       = 64             # cells per MeshBlock in X2
+nx3       = 1              # cells per MeshBlock in X3
+
+<time>
+evolution  = dynamic       # dynamic (time-dependent) evolution
+integrator = rk2           # 2nd-order Runge-Kutta (vl2 in Athena++)
+cfl_number = 0.2           # CFL number (conservative for SR MHD)
+nlim       = -1            # cycle limit (-1 = unlimited)
+tlim       = 20.0          # time limit (in code units)
+ndiag      = 1             # cycles between stdout diagnostic output
+
+<coord>
+special_rel = true         # enable special relativity
+
+<mhd>
+eos         = ideal        # ideal gas EOS
+reconstruct = ppmx         # piecewise parabolic reconstruction (PPM with limiters)
+rsolver     = hlle         # HLLE Riemann solver (robust for SR MHD)
+gamma       = 1.333333333333  # adiabatic index: 4/3 (ultrarelativistic gas)
+dfloor      = 1.0e-6       # density floor
+pfloor      = 1.0e-2       # pressure floor (important for magnetically dominated regions)
+fofc        = true         # first-order flux correction for robustness
+
+<problem>
+user_srcs = true           # enable user-defined source term (effective gravity)
+grav      = -0.1           # effective gravitational acceleration (g < 0 → -x2 direction)
+amp       = 9.5346e-7      # perturbation amplitude (small to stay in linear regime)
+sigma     = 10.0           # magnetization: sigma = B^2/rho (b0 = sqrt(sigma))
+delta     = 0.01           # reference current-sheet half-thickness
+a         = 0.005          # smoothing width for tanh/sech^2 profiles
+nx        = 1              # x1 wavenumber of perturbation
+ny        = 1              # x2 wavenumber of perturbation
+nz        = 1              # x3 wavenumber of perturbation (3D only)
+
+<output1>
+file_type = hst            # history file (volume-integrated quantities)
+dt        = 0.05           # output cadence
+
+<output2>
+file_type = vtk            # VTK output for visualization
+variable  = mhd_w          # output: MHD primitive variables (rho, v, p)
+dt        = 0.01           # output cadence
+
+<output3>
+file_type = vtk            # VTK output for magnetic field
+variable  = mhd_bcc        # output: cell-centered magnetic field
+dt        = 0.01           # output cadence
