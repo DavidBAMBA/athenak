@@ -92,7 +92,7 @@ cfl_number = 0.3           # MUST be <= 1/3 in 3D. AthenaK sets dt = cfl*min_i(d
                            #   A grid with dx3 = 2*dx1 survives cfl=0.4 only because the
                            #   sum is then exactly 1.0. Do not rely on that.
 nlim       = -1
-tlim       = 20.0
+tlim       = 10.0
 ndiag      = 100           # keep stdout small on a batch system
 
 <coord>
@@ -122,7 +122,20 @@ fofc        = true
 
 <problem>
 user_srcs = true
-grav      = -0.1
+grav      = -1.0           # RAISED 10x from Gill's fiducial 0.1. eta ~ sqrt(g) exactly
+                           #   (Gill eq. 11/12, confirmed analytically by Groger+2024
+                           #   Fig. 2), so this is 3.16x faster growth: eta 0.55 -> 1.73,
+                           #   e-folding 1.83 -> 0.58, saturation t ~ 21 -> ~6.7.
+                           #   g = 1 is the largest value that still satisfies BOTH of
+                           #   Gill's constraints for this box:
+                           #     Delta/L_dyn = Delta*g/c^2 = 0.010  (need << 1)
+                           #     sqrt(Lz/L_dyn) = 0.447            (need < 1)
+                           #   g = 10 breaks the second (1.414 > 1) -- do not go there.
+grav_ramp = 0.2            # Turn gravity on with a raised cosine over this time instead
+                           #   of instantaneously. Groger+2024 (p.3) ramp over t_g = Lx/c
+                           #   "to avoid artificial transients"; 0.2 ~ the Alfven crossing
+                           #   time t_A = Lx2/v_A = 0.21, and only 1/3 of an e-folding, so
+                           #   it costs nothing in growth. 0 = old instantaneous behaviour.
 grav_on_enthalpy = false   # false = f = D*g (Athena-C convention); true = f = w*g (the
                            #   physically correct inertial force, Gill eq. 5). Setting it
                            #   true makes growth sqrt(6) = 2.45x faster.
@@ -152,7 +165,36 @@ seed_confine = false       # false = Gill's (1+cos(2*pi*ny*x2/ly)) envelope, whi
                            #     contaminate your measurement.
 nx        = 1              # mode numbers (used by iprob=1 only)
 ny        = 1
-nz        = 1
+p_bg      = 1.0e-4         # Uniform background gas pressure, ESSENTIAL IN 3D.
+                           #   Uniform => zero gradient => p_tot = p0 + p_bg is still
+                           #   constant, so the equilibrium is untouched.
+                           #   Why: without it the cold layers have beta = 2p/B^2 ~ 2e-17,
+                           #   below double-precision epsilon (2.2e-16) relative to the
+                           #   total energy, so ConsToPrim cannot recover p at all. The
+                           #   background becomes pressureless dust on magnetic rails and
+                           #   piles into grid-scale caustics: measured at 192x384x96,
+                           #   t=18, far field rho spans [1.1e-3, 13.5] while B^2 stays
+                           #   10.000 +- 0.3% and corr(rho,B^2) = +0.001 -- no field
+                           #   compression, i.e. purely field-aligned motion, with u3 rms
+                           #   20x u1,u2 and an x3 correlation length of 3 cells.
+                           #   1e-4 is exactly the background of the kinetic study
+                           #   Groger, Hakobyan & Sironi 2024 (their T0 = 1e-4 m_e c^2,
+                           #   Table 1): beta = 2e-5, c_s = 0.0129c -- fast enough to
+                           #   erase caustics, still 5 orders below equipartition.
+                           #   2D does NOT need this and must keep p_bg = 0: with no x3
+                           #   extent the fluid cannot slide along B. Measured 2D far
+                           #   field at t=5: rho in [0.998, 1.001] versus 3D [0.67, 1.52].
+nz        = 0              # CRITICAL, and the reason the previous 3D run failed.
+                           #   With nz=1 the seed carries k_z = 2*pi/lz = 125.7. Since B
+                           #   is along x3, such a mode BENDS field lines and magnetic
+                           #   tension stabilises it: (k_z v_A)^2 = 14356 versus the KSI
+                           #   drive eta^2 = 0.30, i.e. stable by a factor 4.8e4. All the
+                           #   seed energy then goes into a stable shear Alfven wave and
+                           #   the sheet only grows from grid noise (measured sigma ~ 0.35,
+                           #   1-KE still 2e-9 at t=20, six orders below the 2D run).
+                           #   nz=0 removes the x3 dependence -> k_z = 0 -> pure
+                           #   interchange, exactly the unstable 2D mode, while the run
+                           #   stays free to develop 3D structure from noise.
 
 #---------------------------------------------------------------------------------------
 # OUTPUT.  Volume dumps are 142 MB (mhd_w) + 85 MB (mhd_bcc) each at this resolution, so
@@ -166,12 +208,12 @@ dt        = 0.01
 <output2>
 file_type = bin            # 3D volume, primitives
 variable  = mhd_w
-dt        = 0.5
+dt        = 0.25
 
 <output3>
 file_type = bin            # 3D volume, cell-centered B
 variable  = mhd_bcc
-dt        = 0.5
+dt        = 0.25
 
 <output4>
 file_type = bin            # x3 slice for the movie, cheap and finely sampled
@@ -181,4 +223,4 @@ dt        = 0.05
 
 <output5>
 file_type = rst
-dt        = 2.0
+dt        = 1.0

@@ -82,6 +82,7 @@
 // Namespace for parameters shared across user-defined functions
 namespace {
   Real grav_acc;    // effective gravitational acceleration (negative = -x2 direction)
+  Real grav_ramp;   // raised-cosine turn-on time for gravity (0 = instantaneous)
   Real refine_thr;  // AMR refinement threshold on |grad(p)|/p
   Real gam_gas;     // adiabatic index, needed by the source term
   bool grav_on_w;   // couple gravity to enthalpy w (paper) instead of rest mass D (Athena-C)
@@ -117,9 +118,34 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   // cos^2(2*pi*x3/lz) -- i.e. the quadratic response to the seed.
   // Default false = faithful to Gill+2018 eq. (15).
   bool seed_confine = pin->GetOrAddBoolean("problem", "seed_confine", false);
+  // Uniform background gas pressure added on top of p0*sech^2(x2/a).  Being uniform it
+  // has zero gradient, so it does NOT perturb the transverse balance -- p_tot just
+  // becomes p0 + p_bg, still constant.  Its only role is numerical, and it is essential
+  // in 3D:
+  //   Without it the cold magnetized layers have p/(B^2/2) ~ 2e-17, BELOW double
+  //   precision epsilon (2.2e-16) relative to the total energy, so ConsToPrim cannot
+  //   recover the gas pressure at all.  The background then behaves as pressureless dust
+  //   threaded by B: it slides freely ALONG the field lines and piles up into grid-scale
+  //   caustics.  Measured in a 192x384x96 run at t=18: far-field rho spans [1.1e-3, 13.5]
+  //   while B^2 stays at 10.000 +- 0.3% and corr(rho, B^2) = +0.001 -- i.e. the density
+  //   structure involves no field compression at all, which is only possible for
+  //   field-aligned motion.  u3 rms exceeds u1, u2 by 20x and the x3 correlation length
+  //   is 3 cells.  2D is immune because there is no x3 extent to slide along.
+  //   p_bg = 1e-4 reproduces the background of the kinetic study Groger, Hakobyan &
+  //   Sironi 2024 (their T0 = 1e-4 m_e c^2, Table 1), giving beta = 2*p_bg/B^2 = 2e-5 and
+  //   a background sound speed c_s = 0.0129 c -- enough to erase caustics, still 5 orders
+  //   below equipartition, and 9 orders above the roundoff limit.
+  //   Default 0.0 keeps the validated 2D setup untouched.
+  Real p_bg = pin->GetOrAddReal("problem", "p_bg", 0.0);
 
   // Store shared parameters for user BC and source term functions
   grav_acc   = pin->GetOrAddReal("problem", "grav", -0.1);
+  // Turn gravity on smoothly over grav_ramp with a raised cosine, following Groger,
+  // Hakobyan & Sironi (2024) p.3, who ramp over t_g = Lx/c "to avoid artificial
+  // transients" in an otherwise stable equilibrium. Switching a 2-4% force imbalance on
+  // instantaneously rings the box on the Alfven crossing time t_A = Lx2/v_A ~ 0.21 and
+  // that ringing is what dominates 2-KE at early times. 0 = instantaneous (old behaviour).
+  grav_ramp  = pin->GetOrAddReal("problem", "grav_ramp", 0.0);
   refine_thr = pin->GetOrAddReal("problem", "thr",  0.25);
   gam_gas    = pin->GetOrAddReal("mhd", "gamma", 4.0/3.0);
   // Which inertia does the effective gravity couple to?  See KSIGravitySourceTerm.
@@ -219,7 +245,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Real sech2    = 1.0 / (cosh_val * cosh_val);
 
     Real rho  = d0 + 2.0 * d0 * sech2;
-    Real pgas = p0 * sech2;
+    Real pgas = p0 * sech2 + p_bg;   // p_bg uniform -> p_tot = p0 + p_bg, still constant
 
     // x2-envelope: vanishes at both walls so the seed never pushes on the boundary
     // Gill+2018 eq. (15) envelope, or a sheet-confined one (see seed_confine above).
@@ -350,6 +376,11 @@ void KSIGravitySourceTerm(Mesh *pm, const Real bdt) {
   int nmb1 = pmbp->nmb_thispack - 1;
 
   Real g     = grav_acc;
+  // Raised-cosine turn-on (Groger+2024): g(t) = g*[1 - cos(pi t/t_ramp)]/2 for t < t_ramp
+  if (grav_ramp > 0.0) {
+    Real tnow = pm->time;
+    if (tnow < grav_ramp) g *= 0.5*(1.0 - cos(M_PI*tnow/grav_ramp));
+  }
   Real gamma = gam_gas;
   bool on_w  = grav_on_w;
   auto &u0   = pmbp->pmhd->u0;
