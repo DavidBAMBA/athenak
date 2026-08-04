@@ -48,8 +48,14 @@ nx3       = 1              # cells per MeshBlock in X3
 
 <time>
 evolution  = dynamic       # dynamic (time-dependent) evolution
-integrator = rk2           # 2nd-order Runge-Kutta (vl2 in Athena++)
-cfl_number = 0.2           # CFL number (conservative for SR MHD)
+integrator = rk2           # 2nd-order Runge-Kutta (closest to Athena-C's VL integrator;
+                           #   AthenaK has no vl2 option)
+cfl_number = 0.5           # SAME as Athena-C cour_no=0.5: the two codes use an identical
+                           #   convention, dt = cfl * min_i(dx_i/(|v_i|+c_f)).
+                           #   Athena-C new_dt.c:168-174 takes MAX over dimensions of
+                           #   max_v_i/dx_i then dt = CourNo/max_dti; AthenaK
+                           #   mhd_newdt.cpp:157-159 takes min(dt1,dt2,dt3). No factor of
+                           #   ndim enters either one.
 nlim       = -1            # cycle limit (-1 = unlimited)
 tlim       = 20.0          # time limit (in code units)
 ndiag      = 1             # cycles between stdout diagnostic output
@@ -59,34 +65,62 @@ special_rel = true         # enable special relativity
 
 <mhd>
 eos         = ideal        # ideal gas EOS
-reconstruct = ppmx         # piecewise parabolic reconstruction (PPM with limiters)
-rsolver     = hlle         # HLLE Riemann solver (robust for SR MHD)
+reconstruct = ppmx         # EXACT match to Athena-C's --with-order=3p. That selects
+                           #   THIRD_ORDER_PRIM -> reconstruction/lr_states_prim3.c, whose
+                           #   header states it reconstructs "primitive variables using the
+                           #   extremum-preserving limiters of Colella & Sekora" -- which is
+                           #   precisely AthenaK's ppmx. (ppm4 is the plain Colella-Woodward
+                           #   limiter and would NOT match.)
+rsolver     = hlld         # MATCHES Athena-C (--with-flux=hlld -> rsolvers/hlld_sr.c) and
+                           #   Gill+2018, who used HLLD. This is the AthenaK port of the
+                           #   5-wave SR HLLD of Mignone, Ugliano & Bodo (2009), added in
+                           #   src/mhd/rsolvers/hlld_srmhd.hpp (it did not exist upstream --
+                           #   AthenaK's SR MHD only had llf and hlle).
+                           #   Validated on the MUB 1-4 shock tubes: see
+                           #   build_test_hlld/README.md and build_test_hlld/figs/.
+                           #   Costs ~1.2-1.5x HLLE on CPU; it falls back to HLLE
+                           #   automatically in cells where the pressure iteration fails.
+                           #   Set to 'hlle' if you hit robustness trouble.
 gamma       = 1.333333333333  # adiabatic index: 4/3 (ultrarelativistic gas)
-dfloor      = 1.0e-6       # density floor
-pfloor      = 1.0e-2       # pressure floor (important for magnetically dominated regions)
-fofc        = true         # first-order flux correction for robustness
+dfloor      = 1.0e-10      # density floor (rho is O(1) everywhere; floor must never bite)
+pfloor      = 1.0e-18      # pressure floor. MUST stay below the analytic minimum gas
+                           #   pressure p0*sech^2(x2max/a) = 5*sech^2(20) = 8.66e-17,
+                           #   otherwise the floor rewrites the equilibrium. Athena-C uses
+                           #   TINY_NUMBER = 1.0e-20 (defs.h:158) here.
+                           #   The old value 1.0e-2 broke total pressure balance and also
+                           #   made FOFC fire over ~84% of the domain.
+fofc        = true         # first-order flux correction; a safety net only. With the floors
+                           #   above it should almost never trigger -- watch the fofc counter.
+                           #   Athena-C ran with NO_FIRST_ORDER_FLUX_CORRECTION.
 
 <problem>
 user_srcs = true           # enable user-defined source term (effective gravity)
-grav      = -0.1           # effective gravitational acceleration (g < 0 → -x2 direction)
-amp       = 9.5346e-7      # perturbation amplitude (small to stay in linear regime)
+grav      = -0.1           # effective gravitational acceleration (g < 0 -> -x2 direction)
+                           #   Gill+2018 Fig. 5/7/9 high-gravity case
+grav_on_enthalpy = false   # false = f = D*g, reproducing Athena-C's StaticGravPot (default,
+                           #   use this to validate the port against the Athena-C run).
+                           # true  = f = w*g, the physically correct inertial force and the
+                           #   one Gill+2018 eq. (5) assumes; growth is then sqrt(6) = 2.45x
+                           #   faster (eta = 1.34 vs 0.61, saturation t ~ 9 vs t ~ 19).
+amp       = 9.5346e-7      # = kappa_v * v_A = 1e-6 * sqrt(10/11), Gill+2018 eq. (15) fiducial
 sigma     = 10.0           # magnetization: sigma = B^2/rho (b0 = sqrt(sigma))
-delta     = 0.01           # reference current-sheet half-thickness
-a         = 0.005          # smoothing width for tanh/sech^2 profiles
+delta     = 0.01           # Gill+2018 Delta: the FULL fluid-frame width of the hot layer
+a         = 0.005          # tanh/sech^2 scale length = delta/2 (do NOT omit: ksi.cpp
+                           #   defaults a = delta, which would double the sheet thickness)
 nx        = 1              # x1 wavenumber of perturbation
 ny        = 1              # x2 wavenumber of perturbation
 nz        = 1              # x3 wavenumber of perturbation (3D only)
 
 <output1>
 file_type = hst            # history file (volume-integrated quantities)
-dt        = 0.05           # output cadence
+dt        = 0.01           # fine cadence so the linear growth rate can be fitted
 
 <output2>
 file_type = vtk            # VTK output for visualization
-variable  = mhd_w          # output: MHD primitive variables (rho, v, p)
-dt        = 0.01           # output cadence
+variable  = mhd_w          # output: MHD primitive variables (rho, v, e_internal)
+dt        = 0.1            # matches Athena-C athinput.2Dks (<output2> dt = 0.1)
 
 <output3>
 file_type = vtk            # VTK output for magnetic field
 variable  = mhd_bcc        # output: cell-centered magnetic field
-dt        = 0.01           # output cadence
+dt        = 0.1            # matches Athena-C cadence

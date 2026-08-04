@@ -52,6 +52,8 @@
 namespace {
   Real grav_acc;    // effective gravitational acceleration (negative = -x2 direction)
   Real refine_thr;  // AMR refinement threshold on |grad(p)|/p
+  Real gam_gas;     // adiabatic index, needed by the source term
+  bool grav_on_w;   // couple gravity to enthalpy w (paper) instead of rest mass D (Athena-C)
 }
 
 // Forward declarations for user-defined functions
@@ -76,6 +78,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   // Store shared parameters for user BC and source term functions
   grav_acc   = pin->GetOrAddReal("problem", "grav", -0.1);
   refine_thr = pin->GetOrAddReal("problem", "thr",  0.25);
+  gam_gas    = pin->GetOrAddReal("mhd", "gamma", 4.0/3.0);
+  // Which inertia does the effective gravity couple to?  See KSIGravitySourceTerm.
+  //   false (default) -> f = D*g,  reproducing Athena-C's StaticGravPot machinery
+  //   true            -> f = w*g,  reproducing Gill, Granot & Lyubarsky (2018) eq. (5)
+  grav_on_w  = pin->GetOrAddBoolean("problem", "grav_on_enthalpy", false);
 
   // Enroll user-defined boundary condition function (x2 walls only)
   user_bcs_func = KSIBoundaries;
@@ -110,6 +117,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   Real d0  = 1.0;
   Real b0_ = std::sqrt(sigma * d0);  // field amplitude: b0 = sqrt(sigma)
   Real p0  = 0.5 * b0_ * b0_;        // pressure balance: p0 = b0^2/2
+
+  // AthenaK stores the INTERNAL ENERGY DENSITY e = p_gas/(gamma-1) in the w0(IEN)==w0(IPR)
+  // slot, not the gas pressure.  See SingleP2C_IdealSRMHD() in eos/ideal_c2p_mhd.hpp, where
+  // the total enthalpy is (w.d + gamma*w.e + b^2) and the gas pressure is (gamma-1)*w.e.
+  Real gm1 = pmbp->pmhd->peos->eos_data.gamma - 1.0;
 
   // Domain extents (for perturbation wavenumbers)
   Real lx = pmy_mesh_->mesh_size.x1max - pmy_mesh_->mesh_size.x1min;
@@ -151,7 +163,6 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Real pgas = p0 * sech2;
 
     // Velocity perturbation in x2-direction
-    // For small amp, spatial 4-velocity u^2 ≈ 3-velocity v^2
     Real v2;
     if (three_d) {
       v2 = amp * 0.25
@@ -166,9 +177,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
     w0(m, IDN, k, j, i) = rho;
     w0(m, IVX, k, j, i) = 0.0;
-    w0(m, IVY, k, j, i) = v2;
+    // SR primitives are the spatial 4-velocity u^i = gamma*v^i, not the 3-velocity
+    w0(m, IVY, k, j, i) = v2 / sqrt(1.0 - v2*v2);
     w0(m, IVZ, k, j, i) = 0.0;
-    w0(m, IPR, k, j, i) = pgas;
+    // w0(IEN) is the internal energy density e = p_gas/(gamma-1), NOT p_gas
+    w0(m, IEN, k, j, i) = pgas / gm1;
   });
 
   // -----------------------------------------------------------------------
@@ -223,12 +236,38 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 //! \fn void KSIGravitySourceTerm()
 //! \brief Constant effective gravity source term in -x2 direction (SR MHD version).
 //!
-//! Adds to conserved variables:
-//!   Momentum: dS_2/dt = D * g    where D = rho*gamma (conserved baryon density)
-//!   Energy:   dtau/dt = S_2 * g  (work done by gravity on existing momentum)
+//! For an external force density f_i acting on the rest mass, the SR conservation laws are
+//!   d(S_i)/dt = f_i          with f_2 = D*g,  D = rho*W the conserved baryon density
+//!   d(tau)/dt = f_i v^i      = D*g*v^2       (the rate at which that force does work)
 //!
-//! This is the AthenaK-native SR convention, equivalent to the Athena++ flux-averaged
-//! formulation in the continuous limit.
+//! The work term MUST use the 3-velocity v^2, NOT the conserved momentum S_2.  In SR MHD
+//! S_2 = (rho*h + b^2)*W^2*v^2 - b^0 b^2, which exceeds D*v^2 by the factor (rho*h+b^2)/rho
+//! -- about 11x in the magnetically dominated region at sigma=10 and about 8x inside the
+//! sheet.  Using S_2*g (as AthenaK's built-in SourceTerms::ConstantAccel does for SR)
+//! over-injects energy by that factor and destroys the hydrostatic response.
+//!
+//! Athena-C does the same thing correctly: integrate_2d_vl_sr.c sources the energy with the
+//! conserved MASS flux x2Flux[].d = D*v^2, not with the momentum.
+//!
+//! WHICH INERTIA DOES GRAVITY COUPLE TO?  (problem/grav_on_enthalpy)
+//!
+//! This effective gravity is an INERTIAL force from the frame acceleration of the jet, so
+//! physically it couples to the total inertia density w = rho*h + b^2, not to the rest mass.
+//! Gill, Granot & Lyubarsky (2018) eq. (5) writes w*dv/dt = -c^2 grad(p) + (B.grad)B + w*g,
+//! and their Atwood number eq. (21) is built from w_h = rho_h + 4 p_h = 23 and
+//! w_c = rho_c + b0^2 = 11, giving A = 12/34 = 0.353 and eta = 1.342 (e-fold 0.745).
+//!
+//! Athena-C's StaticGravPot machinery can only source D*g (integrate_2d_vl_sr.c:432 uses
+//! pG->U[].d, which under SPECIAL_RELATIVITY is D = rho*W).  That replaces the numerator of
+//! the Atwood number by rho_h - rho_c = 2 instead of w_h - w_c = 12, so the drive is 6x
+//! weaker in eta^2, i.e. sqrt(6) = 2.45x slower growth (eta ~ 0.61, e-fold ~ 1.6).
+//!
+//! DEFAULT is false = D*g, which reproduces the Athena-C run this port is being validated
+//! against.  Set problem/grav_on_enthalpy = true to recover the paper's linear growth rate.
+//!
+//! D*v^2 is recovered from the primitives without a Lorentz factor: D*v^2 = (rho*W)(u^2/W)
+//! = rho * u^2 = w0(IDN)*w0(IVY).  w0 holds the beginning-of-stage state (the same state the
+//! fluxes were reconstructed from), which matches Athena-C's use of U^n / U^{n+1/2}.
 
 void KSIGravitySourceTerm(Mesh *pm, const Real bdt) {
   MeshBlockPack *pmbp = pm->pmb_pack;
@@ -238,15 +277,43 @@ void KSIGravitySourceTerm(Mesh *pm, const Real bdt) {
   int ks = indcs.ks, ke = indcs.ke;
   int nmb1 = pmbp->nmb_thispack - 1;
 
-  Real g = grav_acc;
-  auto &u0 = pmbp->pmhd->u0;
+  Real g     = grav_acc;
+  Real gamma = gam_gas;
+  bool on_w  = grav_on_w;
+  auto &u0   = pmbp->pmhd->u0;
+  auto &w0   = pmbp->pmhd->w0;
+  auto &bcc0 = pmbp->pmhd->bcc0;
 
   par_for("ksi_grav", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    Real D  = u0(m, IDN, k, j, i);   // conserved density D = rho * Lorentz factor
-    Real S2 = u0(m, IM2, k, j, i);   // x2-momentum before gravity update
-    u0(m, IM2, k, j, i) += bdt * g * D;   // momentum source: S_M2 += D*g*dt
-    u0(m, IEN, k, j, i) += bdt * g * S2;  // energy source:   tau  += S2*g*dt
+    Real rho = w0(m, IDN, k, j, i);
+    Real ux  = w0(m, IVX, k, j, i);
+    Real uy  = w0(m, IVY, k, j, i);
+    Real uz  = w0(m, IVZ, k, j, i);
+    Real lor = sqrt(1.0 + ux*ux + uy*uy + uz*uz);   // Lorentz factor W
+
+    // Inertia density the force couples to, per unit coordinate volume.
+    Real finert;
+    if (on_w) {
+      // w = rho*h + b^2 = rho + gamma*e + b^2, with the fluid-frame b^2 from the
+      // cell-centered field:  b^2 = (B^2 + (B.u)^2/W^2)/W^2 * W^2 ... evaluated as
+      // b^2 = B^2/W^2 + (B.v)^2, using v^i = u^i/W.
+      Real bx = bcc0(m, IBX, k, j, i);
+      Real by = bcc0(m, IBY, k, j, i);
+      Real bz = bcc0(m, IBZ, k, j, i);
+      Real bdotv = (bx*ux + by*uy + bz*uz) / lor;
+      Real bsq   = (bx*bx + by*by + bz*bz) / (lor*lor) + bdotv*bdotv;
+      Real wtot  = rho + gamma*w0(m, IEN, k, j, i) + bsq;
+      finert = wtot * lor * lor;   // w*W^2, the coordinate-volume inertia density
+    } else {
+      finert = rho * lor;          // D = rho*W  (Athena-C StaticGravPot convention)
+    }
+
+    // v^2 = u^2/W, so the work rate is (inertia)*g*v^2
+    Real v2 = uy / lor;
+
+    u0(m, IM2, k, j, i) += bdt * g * finert;      // momentum: dS_2 = f*g*dt
+    u0(m, IEN, k, j, i) += bdt * g * finert * v2; // energy:   dtau = f*g*v^2*dt
   });
 
   return;
@@ -290,7 +357,11 @@ void KSIBoundaries(Mesh *pm) {
   auto &b0_     = pmbp->pmhd->b0;
   auto &bcc_    = pmbp->pmhd->bcc0;
 
-  Real g = grav_acc;
+  Real g   = grav_acc;
+  // w0(IEN) holds the internal energy density e = p_gas/(gamma-1), so a hydrostatic
+  // PRESSURE increment dp must be applied to e as dp/(gamma-1).
+  Real gm1 = pmbp->pmhd->peos->eos_data.gamma - 1.0;
+  Real efloor = pmbp->pmhd->peos->eos_data.pfloor / gm1;
 
   // -----------------------------------------------------------------------
   // Step 1: Set face-centered B in x2 ghost zones
@@ -312,18 +383,20 @@ void KSIBoundaries(Mesh *pm) {
     // --- Inner X2 boundary ---
     if (mb_bcs.d_view(m, BoundaryFace::inner_x2) == BoundaryFlag::user) {
       for (int jg = 0; jg < ng; ++jg) {
-        // B1 (x1-face): copy from first active cell row
-        b0_.x1f(m, k, js-jg-1, i) = b0_.x1f(m, k, js, i);
+        // B1 (x1-face): tangential -> symmetric MIRROR about the wall, matching
+        // Athena-C reflect_ix2 (B1i[js-j] = B1i[js+j-1]).  A flat copy from the single
+        // row js would zero the gradient instead of reflecting it.
+        b0_.x1f(m, k, js-jg-1, i) = b0_.x1f(m, k, js+jg, i);
         if (i == n1-1) {
-          b0_.x1f(m, k, js-jg-1, i+1) = b0_.x1f(m, k, js, i+1);
+          b0_.x1f(m, k, js-jg-1, i+1) = b0_.x1f(m, k, js+jg, i+1);
         }
-        // B2 (x2-face): antisymmetric about the inner wall (b0.x2f(js) = 0)
+        // B2 (x2-face): normal -> antisymmetric about the inner wall (b0.x2f(js) = 0)
         // ghost face js-jg-1  mirrors  active face js+jg+1
         b0_.x2f(m, k, js-jg-1, i) = -b0_.x2f(m, k, js+jg+1, i);
-        // B3 (x3-face): copy from first active cell row
-        b0_.x3f(m, k, js-jg-1, i) = b0_.x3f(m, k, js, i);
+        // B3 (x3-face): tangential -> symmetric mirror (Athena-C: B3i[js-j] = B3i[js+j-1])
+        b0_.x3f(m, k, js-jg-1, i) = b0_.x3f(m, k, js+jg, i);
         if (k == n3-1) {
-          b0_.x3f(m, k+1, js-jg-1, i) = b0_.x3f(m, k+1, js, i);
+          b0_.x3f(m, k+1, js-jg-1, i) = b0_.x3f(m, k+1, js+jg, i);
         }
       }
     }
@@ -331,33 +404,38 @@ void KSIBoundaries(Mesh *pm) {
     // --- Outer X2 boundary ---
     if (mb_bcs.d_view(m, BoundaryFace::outer_x2) == BoundaryFlag::user) {
       for (int jg = 0; jg < ng; ++jg) {
-        // B1 (x1-face): copy from last active cell row
-        b0_.x1f(m, k, je+jg+1, i) = b0_.x1f(m, k, je, i);
+        // B1 (x1-face): tangential -> symmetric MIRROR (Athena-C: B1i[je+j] = B1i[je-j+1])
+        b0_.x1f(m, k, je+jg+1, i) = b0_.x1f(m, k, je-jg, i);
         if (i == n1-1) {
-          b0_.x1f(m, k, je+jg+1, i+1) = b0_.x1f(m, k, je, i+1);
+          b0_.x1f(m, k, je+jg+1, i+1) = b0_.x1f(m, k, je-jg, i+1);
         }
-        // B2 (x2-face): antisymmetric about the outer wall (b0.x2f(je+1) = 0)
+        // B2 (x2-face): normal -> antisymmetric about the outer wall (b0.x2f(je+1) = 0)
         // ghost face je+jg+2  mirrors  active face je-jg
         b0_.x2f(m, k, je+jg+2, i) = -b0_.x2f(m, k, je-jg, i);
-        // B3 (x3-face): copy from last active cell row
-        b0_.x3f(m, k, je+jg+1, i) = b0_.x3f(m, k, je, i);
+        // B3 (x3-face): tangential -> symmetric mirror
+        b0_.x3f(m, k, je+jg+1, i) = b0_.x3f(m, k, je-jg, i);
         if (k == n3-1) {
-          b0_.x3f(m, k+1, je+jg+1, i) = b0_.x3f(m, k+1, je, i);
+          b0_.x3f(m, k+1, je+jg+1, i) = b0_.x3f(m, k+1, je-jg, i);
         }
       }
     }
   });
 
   // -----------------------------------------------------------------------
-  // Step 2: ConsToPrim in x2 ghost zones + boundary active cells
-  //   This converts u0 (unchanged in ghost zones) and the updated b0 into
-  //   w0 (primitives) and bcc0 (cell-centered B). For SR MHD, this involves
-  //   an iterative inversion.
+  // Step 2: ConsToPrim in x2 ghost zones + the mirror active cells
+  //   Converts u0 and the updated b0 into w0 (primitives) and bcc0 (cell-centered B).
+  //
+  //   The j-range MUST span every mirror cell that Step 3 reads, i.e. js..js+ng-1 and
+  //   je-ng+1..je -- not just the single row js/je.  ApplyPhysicalBCs runs BEFORE the
+  //   global ConToPrim task (see mhd_tasks.cpp: ... rkupdt -> srctrms -> ... -> bcs ->
+  //   prol -> c2p), so on entry w0 still holds the PREVIOUS stage's primitives.  Reading
+  //   un-refreshed mirror rows would build the ghost zones from stale data and degrade the
+  //   wall to first order in time.
   // -----------------------------------------------------------------------
   pmbp->pmhd->peos->ConsToPrim(u0_, b0_, w0_, bcc_,
-                                false, 0, n1-1, js-ng, js,   0, n3-1);
+                                false, 0, n1-1, js-ng,    js+ng-1, 0, n3-1);
   pmbp->pmhd->peos->ConsToPrim(u0_, b0_, w0_, bcc_,
-                                false, 0, n1-1, je,    je+ng, 0, n3-1);
+                                false, 0, n1-1, je-ng+1,  je+ng,   0, n3-1);
 
   // -----------------------------------------------------------------------
   // Step 3: Override primitives in x2 ghost zones
@@ -381,13 +459,15 @@ void KSIBoundaries(Mesh *pm) {
         if (n == IVY) {
           // Reflect x2-velocity
           w0_(m, n, k, j_ghost, i) = -w0_(m, n, k, j_mirror, i);
-        } else if (n == IPR) {
-          // Hydrostatic pressure correction (uses mirror density, not ghost density)
+        } else if (n == IEN) {
+          // Hydrostatic correction (uses mirror density, not ghost density).
+          // Athena-C KSI.c reflect_ix2: W.P += W.d * |g| * (2j-1) * dx2
           Real rho_mirror = w0_(m, IDN, k, j_mirror, i);
-          Real p_mirror   = w0_(m, IPR, k, j_mirror, i);
+          Real e_mirror   = w0_(m, IEN, k, j_mirror, i);
           Real dist       = (2.0*jg + 1.0) * dx2;
-          // g < 0 (downward), dist > 0 → p_ghost > p_mirror (pressure increases inward)
-          w0_(m, n, k, j_ghost, i) = fmax(p_mirror - rho_mirror*g*dist, 1.0e-15);
+          // g < 0 (downward), dist > 0 -> p_ghost > p_mirror (pressure increases inward)
+          Real dp         = -rho_mirror * g * dist;
+          w0_(m, n, k, j_ghost, i) = fmax(e_mirror + dp/gm1, efloor);
         } else {
           // Copy all other variables (IDN, IVX, IVZ)
           w0_(m, n, k, j_ghost, i) = w0_(m, n, k, j_mirror, i);
@@ -404,13 +484,14 @@ void KSIBoundaries(Mesh *pm) {
         if (n == IVY) {
           // Reflect x2-velocity
           w0_(m, n, k, j_ghost, i) = -w0_(m, n, k, j_mirror, i);
-        } else if (n == IPR) {
-          // Hydrostatic pressure correction
+        } else if (n == IEN) {
+          // Hydrostatic correction; Athena-C reflect_ox2: W.P -= W.d * |g| * (2j-1) * dx2
           Real rho_mirror = w0_(m, IDN, k, j_mirror, i);
-          Real p_mirror   = w0_(m, IPR, k, j_mirror, i);
+          Real e_mirror   = w0_(m, IEN, k, j_mirror, i);
           Real dist       = (2.0*jg + 1.0) * dx2;
-          // g < 0 (downward), dist > 0 → p_ghost < p_mirror (pressure decreases outward)
-          w0_(m, n, k, j_ghost, i) = fmax(p_mirror + rho_mirror*g*dist, 1.0e-15);
+          // g < 0 (downward), dist > 0 -> p_ghost < p_mirror (pressure decreases outward)
+          Real dp         = rho_mirror * g * dist;
+          w0_(m, n, k, j_ghost, i) = fmax(e_mirror + dp/gm1, efloor);
         } else {
           // Copy all other variables
           w0_(m, n, k, j_ghost, i) = w0_(m, n, k, j_mirror, i);

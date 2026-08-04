@@ -233,6 +233,8 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
           rsolver_method = MHD_RSolver::llf_sr;
         } else if (rsolver.compare("hlle") == 0) {
           rsolver_method = MHD_RSolver::hlle_sr;
+        } else if (rsolver.compare("hlld") == 0) {
+          rsolver_method = MHD_RSolver::hlld_sr;
         // Error for anything else
         } else {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__

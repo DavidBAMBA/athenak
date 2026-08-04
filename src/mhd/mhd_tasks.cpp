@@ -189,6 +189,8 @@ TaskStatus MHD::Fluxes(Driver *pdrive, int stage) {
     CalculateFluxes<MHD_RSolver::llf_sr>(pdrive, stage);
   } else if (rsolver_method == MHD_RSolver::hlle_sr) {
     CalculateFluxes<MHD_RSolver::hlle_sr>(pdrive, stage);
+  } else if (rsolver_method == MHD_RSolver::hlld_sr) {
+    CalculateFluxes<MHD_RSolver::hlld_sr>(pdrive, stage);
   } else if (rsolver_method == MHD_RSolver::llf_gr) {
     CalculateFluxes<MHD_RSolver::llf_gr>(pdrive, stage);
   } else if (rsolver_method == MHD_RSolver::hlle_gr) {

@@ -37,7 +37,7 @@ using MHDBoundaryFnPtr = void (*)(int m, Mesh* pm, MHD* pmhd, DvceArray5D<Real> 
 
 // constants that enumerate MHD Riemann Solver options
 enum class MHD_RSolver {advect, llf, hlle, hlld, roe,   // non-relativistic
-                        llf_sr, hlle_sr,                // SR
+                        llf_sr, hlle_sr, hlld_sr,       // SR
                         llf_gr, hlle_gr};                       // GR
 
 //----------------------------------------------------------------------------------------
