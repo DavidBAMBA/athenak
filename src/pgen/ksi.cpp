@@ -7,8 +7,31 @@
 //! \brief Problem generator for the Kruskal-Schwarzschild instability (KSI)
 //!        in special relativistic MHD.
 //!
-//! Ported from Athena++ 2dksi.cpp to the GPU-capable AthenaK version.
-//! Supports both 2D and 3D configurations (auto-detected from mesh dimensions).
+//! Supports both 2D and 3D configurations (auto-detected from the mesh, exactly as
+//! rt.cpp does: `three_d = (indcs.nx3 > 1)` selects the branch).
+//!
+//! GEOMETRY (identical in 2D and 3D, following Athena-C KSI.c):
+//!   x1  transverse to the sheet-normal, PERIODIC        (Gill's y)
+//!   x2  sheet normal, gravity direction, REFLECTING     (Gill's z)
+//!   x3  out of the 2D plane, PERIODIC; also the initial B direction
+//! The current sheet lies in the x1-x3 plane at x2 = 0 and gravity is along -x2 in BOTH
+//! 2D and 3D.  This differs from rt.cpp, which rotates gravity from x2 (2D) to x3 (3D);
+//! here x3 must stay the field direction, so the walls remain on x2 in 3D too.  That
+//! keeps KSIBoundaries() dimension-independent -- it only ever touches x2.
+//!
+//! ON HYDROSTATIC BALANCE (the hard part of this setup):
+//!   An exactly balanced initial state DOES NOT EXIST for these profiles.  Relativistic
+//!   hydrostatic equilibrium requires d(p_gas + B^2/2)/dx2 = -w*g with w = rho*h + b^2.
+//!   Integrating that ODE downward from the sheet with sigma=10 drives p_gas negative at
+//!   x2 = -0.0168 (only 3.4a below the sheet): at this magnetization the field already
+//!   accounts for the entire pressure budget, so there is no gas pressure left to hold
+//!   up the weight.  Gill, Granot & Lyubarsky (2018) therefore drop the stratification
+//!   explicitly (their eqs. 8-10), keeping p_tot uniform and relying on
+//!     Delta << c^2/g == L_dyn,   here 0.01 << 10.
+//!   The residual imbalance is O(g*L_x2) ~ 2-4%; the slab settles against the reflecting
+//!   walls on an Alfven crossing time t_A = L_x2/v_A ~ 0.21, well before the instability
+//!   becomes nonlinear.  The hydrostatic pressure correction in KSIBoundaries() is what
+//!   keeps that settling from launching spurious acoustic waves off the walls.
 //!
 //! Equilibrium profiles (smooth tanh/sech^2, following Athena-C KSI.c):
 //!   B3     = -b0 * tanh(x2/a)        (reversed-field current sheet)
@@ -18,10 +41,16 @@
 //! Total pressure balance: pgas + B^2/2 = p0 everywhere
 //! (uses the identity sech^2(xi) + tanh^2(xi) = 1, and p0 = b0^2/2).
 //!
-//! Velocity perturbation in x2-direction only:
-//!   2D: v2 = amp * 0.5 * sin(2*pi*nx*x1/lx) * (1 + cos(2*pi*ny*x2/ly))
-//!   3D: v2 = amp * 0.25 * sin(2*pi*nx*x1/lx) * cos(2*pi*nz*x3/lz)
-//!                       * (1 + cos(2*pi*ny*x2/ly))
+//! Velocity perturbation in the x2-direction only, selected by problem/iprob:
+//!   iprob = 1 (single mode, the Gill+2018 / Athena-C fiducial)
+//!     2D: v2 = amp * 0.5  * sin(2*pi*nx*x1/lx) * (1 + cos(2*pi*ny*x2/ly))
+//!     3D: v2 = amp * 0.25 * sin(2*pi*nx*x1/lx) * cos(2*pi*nz*x3/lz)
+//!                         * (1 + cos(2*pi*ny*x2/ly))
+//!   iprob = 2 (multimode, white noise seeded by the same x2 envelope)
+//!     v2 = amp * (rand - 0.5) * (1 + cos(2*pi*ny*x2/ly))
+//!   In 3D a single mode forces one artificially coherent sheet of fingers; iprob=2 is
+//!   the physical choice there, and is what rt.cpp defaults to for its 3D runs.  Use
+//!   iprob=1 when validating the linear growth rate against the dispersion relation.
 //!
 //! Effective gravity is in -x2 direction, modeling the frame acceleration of a
 //! relativistic jet slab. In the rest frame of the slab, this manifests as a
@@ -47,6 +76,8 @@
 #include "mhd/mhd.hpp"
 #include "bvals/bvals.hpp"
 #include "pgen.hpp"
+
+#include <Kokkos_Random.hpp>
 
 // Namespace for parameters shared across user-defined functions
 namespace {
@@ -74,6 +105,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   int  nx_m   = pin->GetOrAddInteger("problem", "nx", 1);
   int  ny_m   = pin->GetOrAddInteger("problem", "ny", 1);
   int  nz_m   = pin->GetOrAddInteger("problem", "nz", 1);
+  // 1 = single mode (Gill+2018 eq. 15), 2 = multimode white noise. See file header.
+  int  iprob  = pin->GetOrAddInteger("problem", "iprob", 1);
 
   // Store shared parameters for user BC and source term functions
   grav_acc   = pin->GetOrAddReal("problem", "grav", -0.1);
@@ -113,6 +146,13 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     std::exit(EXIT_FAILURE);
   }
 
+  // The sheet needs at least one transverse direction to corrugate in
+  if (pmy_mesh_->one_d) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "KSI problem only works in 2D/3D." << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
   // Derived equilibrium parameters
   Real d0  = 1.0;
   Real b0_ = std::sqrt(sigma * d0);  // field amplitude: b0 = sqrt(sigma)
@@ -138,8 +178,17 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
   // -----------------------------------------------------------------------
   // 1. Initialize primitive variables (density, velocity, pressure)
+  //
+  //    The equilibrium (rho, p_gas, B) is identical in 2D and 3D -- it depends on x2
+  //    only.  What changes is the seed perturbation, so the 2D/3D split is confined to
+  //    the v2 expression, mirroring rt.cpp's rt2d/rt3d kernels.
   // -----------------------------------------------------------------------
   Real two_pi = 2.0 * M_PI;
+
+  // Random pool seeded per-MeshBlock-pack so multimode runs are reproducible for a
+  // given decomposition (same convention as rt.cpp).
+  Kokkos::Random_XorShift64_Pool<> rand_pool64(pmbp->gids);
+
   par_for("ksi_init_w", DevExeSpace(), 0, (pmbp->nmb_thispack - 1),
           ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -155,24 +204,34 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Real &x3max = size.d_view(m).x3max;
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
-    // Smooth equilibrium profiles
+    // Smooth equilibrium profiles (x2 only, same in 2D and 3D)
     Real cosh_val = cosh(x2v / a);
     Real sech2    = 1.0 / (cosh_val * cosh_val);
 
     Real rho  = d0 + 2.0 * d0 * sech2;
     Real pgas = p0 * sech2;
 
-    // Velocity perturbation in x2-direction
+    // x2-envelope: vanishes at both walls so the seed never pushes on the boundary
+    Real env = 1.0 + cos(two_pi * ny_m * x2v / ly);
+
+    // ---- Velocity perturbation in the x2-direction -----------------------
     Real v2;
-    if (three_d) {
-      v2 = amp * 0.25
-           * sin(two_pi * nx_m * x1v / lx)
-           * cos(two_pi * nz_m * x3v / lz)
-           * (1.0 + cos(two_pi * ny_m * x2v / ly));
+    if (iprob == 1) {
+      // Single mode.  The 3D form carries an extra cos(k_z x3) factor and the
+      // amplitude is halved again so that max|v2| stays equal to amp in both cases.
+      if (three_d) {
+        v2 = amp * 0.25 * sin(two_pi * nx_m * x1v / lx)
+                        * cos(two_pi * nz_m * x3v / lz) * env;
+      } else {
+        v2 = amp * 0.5  * sin(two_pi * nx_m * x1v / lx) * env;
+      }
     } else {
-      v2 = amp * 0.5
-           * sin(two_pi * nx_m * x1v / lx)
-           * (1.0 + cos(two_pi * ny_m * x2v / ly));
+      // Multimode: white noise with the same envelope. In 3D this seeds all
+      // transverse wavenumbers at once instead of forcing a single coherent sheet.
+      auto rand_gen = rand_pool64.get_state();
+      Real r = rand_gen.frand() - 0.5;
+      rand_pool64.free_state(rand_gen);
+      v2 = amp * r * env;
     }
 
     w0(m, IDN, k, j, i) = rho;
@@ -332,6 +391,12 @@ void KSIGravitySourceTerm(Mesh *pm, const Real bdt) {
 //!                p_outer_ghost = p_mirror + rho_mirror * g * dist  (g<0 -> p decreases)
 //! For density/v1/v3: copied from mirror cell
 //! For B field:   B2 reflected (antisymmetric), B1 and B3 copied
+//!
+//! DIMENSIONALITY: this function is written once and works unchanged in 2D and 3D,
+//! because the walls are always on x2.  n3 = nx3 + 2*ng in 3D and 1 in 2D, and the k
+//! loop plus the `k == n3-1` guard covers the n3+1 x3-faces in both cases (in 2D
+//! b0.x3f has exactly 2 entries in k, so the guard fills k=1).  Nothing here is
+//! specialized per dimension.
 //!
 //! Flow follows NoInflowTorus pattern in gr_torus.cpp:
 //!   1. Set ghost-zone B field (b0 face-centered)
@@ -525,11 +590,12 @@ void KSIBoundaries(Mesh *pm) {
 
 void KSIRefinement(MeshBlockPack *pmbp) {
   auto &indcs  = pmbp->pmesh->mb_indcs;
-  int &is = indcs.is, &ie = indcs.ie;
-  int &js = indcs.js, &je = indcs.je;
+  int &is = indcs.is;
+  int &js = indcs.js;
   int &ks = indcs.ks;
-  int nx1 = indcs.nx1, nx2 = indcs.nx2;
+  int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
   int nmb = pmbp->nmb_thispack;
+  bool three_d = (nx3 > 1);
 
   // Global MeshBlock ID offset for this MPI rank
   int mbs = pmbp->pmesh->gids_eachrank[global_variable::my_rank];
@@ -538,24 +604,33 @@ void KSIRefinement(MeshBlockPack *pmbp) {
   auto &w0_          = pmbp->pmhd->w0;
   auto &refine_flag_ = pmbp->pmesh->pmr->refine_flag;
 
-  // Use team-level parallelism: outer loop over meshblocks, inner reduction over cells
+  // Use team-level parallelism: outer loop over meshblocks, inner reduction over cells.
+  // The inner range covers nx3*nx2*nx1 cells; in 2D nx3 == 1 so this reduces to the
+  // planar loop and the x3 gradient term is skipped.
   par_for_outer("ksi_refine", DevExeSpace(), 0, 0, 0, (nmb-1),
   KOKKOS_LAMBDA(TeamMember_t tmember, int m) {
-    const int nkji = nx2 * nx1;
+    const int nkji = nx3 * nx2 * nx1;
+    const int nji  = nx2 * nx1;
 
     Real team_maxeps = 0.0;
     Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tmember, nkji),
     [=](const int idx, Real &maxeps) {
-      int jrel = idx / nx1;
-      int irel = idx - jrel * nx1;
+      int krel = idx / nji;
+      int jrel = (idx - krel*nji) / nx1;
+      int irel = idx - krel*nji - jrel*nx1;
+      int k = krel + ks;
       int j = jrel + js;
       int i = irel + is;
 
-      Real p    = w0_(m, IPR, ks, j, i);
+      Real p    = w0_(m, IPR, k, j, i);
       // Centered pressure gradient (uses ghost cells, which must be valid)
-      Real epsx = 0.5 * fabs(w0_(m,IPR,ks,j,i+1) - w0_(m,IPR,ks,j,i-1));
-      Real epsy = 0.5 * fabs(w0_(m,IPR,ks,j+1,i) - w0_(m,IPR,ks,j-1,i));
-      Real eps  = sqrt(epsx*epsx + epsy*epsy) / p;
+      Real epsx = 0.5 * fabs(w0_(m,IPR,k,j,i+1) - w0_(m,IPR,k,j,i-1));
+      Real epsy = 0.5 * fabs(w0_(m,IPR,k,j+1,i) - w0_(m,IPR,k,j-1,i));
+      Real epsz = 0.0;
+      if (three_d) {
+        epsz = 0.5 * fabs(w0_(m,IPR,k+1,j,i) - w0_(m,IPR,k-1,j,i));
+      }
+      Real eps  = sqrt(epsx*epsx + epsy*epsy + epsz*epsz) / p;
       maxeps    = fmax(maxeps, eps);
     }, Kokkos::Max<Real>(team_maxeps));
 
