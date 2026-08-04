@@ -6,7 +6,8 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file hlld_srmhd.hpp
-//! \brief HLLD Riemann solver for special relativistic MHD.
+//! \brief HLLD Riemann solver for special relativistic MHD.  Per-face implementation
+//! for the split-kernel path (see hlle_srmhd.hpp).
 //!
 //! Implements the 5-wave HLLD solver of Mignone, Ugliano & Bodo (2009), MNRAS 393, 1141
 //! ("MUB").  Ported from the Athena++ implementation in
@@ -180,17 +181,20 @@ Real SREResidualPrime(const Real w, const Real dd, const Real m_sq,
 //! \fn void HLLD_SR
 //! \brief The HLLD Riemann solver for SR MHD (MUB 2009).
 
+template <int ivx>
 KOKKOS_INLINE_FUNCTION
-void HLLD_SR(TeamMember_t const &member, const EOS_Data &eos,
-     const RegionIndcs &indcs,const DualArray1D<RegionSize> &size,const CoordData &coord,
-     const int m, const int k, const int j, const int il, const int iu, const int ivx,
-     const ScrArray2D<Real> &wl, const ScrArray2D<Real> &wr,
-     const ScrArray2D<Real> &bl, const ScrArray2D<Real> &br, const DvceArray4D<Real> &bx,
-     DvceArray5D<Real> flx, DvceArray4D<Real> ey, DvceArray4D<Real> ez) {
-  int ivy = IVX + ((ivx-IVX) + 1)%3;
-  int ivz = IVX + ((ivx-IVX) + 2)%3;
-  int iby = ((ivx-IVX) + 1)%3;
-  int ibz = ((ivx-IVX) + 2)%3;
+void HLLD_SR(const EOS_Data &eos,
+             const int m, const int k, const int j, const int i,
+             const int is, const int js, const int ks,
+             const DvceArray5D<Real> &wl, const DvceArray5D<Real> &wr,
+             const DvceArray5D<Real> &bl, const DvceArray5D<Real> &br,
+             const DvceArray4D<Real> &bx,
+             const DvceArray5D<Real> &flx,
+             const DvceArray4D<Real> &ey, const DvceArray4D<Real> &ez) {
+  constexpr int ivy = IVX + ((ivx-IVX) + 1)%3;
+  constexpr int ivz = IVX + ((ivx-IVX) + 2)%3;
+  constexpr int iby = ((ivx-IVX) + 1)%3;
+  constexpr int ibz = ((ivx-IVX) + 2)%3;
   const Real gm1 = (eos.gamma - 1.0);
   const Real gamma_prime = eos.gamma/gm1;
 
@@ -203,343 +207,340 @@ void HLLD_SR(TeamMember_t const &member, const EOS_Data &eos,
   const int  num_secant    = 4;
   const int  num_nr        = 2;
 
-  par_for_inner(member, il, iu, [&](const int i) {
-    // ------------------------------------------------------------------ L and R states
-    Real rho_l = wl(IDN,i);
-    Real u_l[4];
-    u_l[1] = wl(ivx,i);
-    u_l[2] = wl(ivy,i);
-    u_l[3] = wl(ivz,i);
-    u_l[0] = sqrt(1.0 + SQR(u_l[1]) + SQR(u_l[2]) + SQR(u_l[3]));
-    Real bb2_l = bl(iby,i);
-    Real bb3_l = bl(ibz,i);
+  // ------------------------------------------------------------------ L and R states
+  Real rho_l = wl(m,IDN,k,j,i);
+  Real u_l[4];
+  u_l[1] = wl(m,ivx,k,j,i);
+  u_l[2] = wl(m,ivy,k,j,i);
+  u_l[3] = wl(m,ivz,k,j,i);
+  u_l[0] = sqrt(1.0 + SQR(u_l[1]) + SQR(u_l[2]) + SQR(u_l[3]));
+  Real bb2_l = bl(m,iby,k,j,i);
+  Real bb3_l = bl(m,ibz,k,j,i);
 
-    Real rho_r = wr(IDN,i);
-    Real u_r[4];
-    u_r[1] = wr(ivx,i);
-    u_r[2] = wr(ivy,i);
-    u_r[3] = wr(ivz,i);
-    u_r[0] = sqrt(1.0 + SQR(u_r[1]) + SQR(u_r[2]) + SQR(u_r[3]));
-    Real bb2_r = br(iby,i);
-    Real bb3_r = br(ibz,i);
+  Real rho_r = wr(m,IDN,k,j,i);
+  Real u_r[4];
+  u_r[1] = wr(m,ivx,k,j,i);
+  u_r[2] = wr(m,ivy,k,j,i);
+  u_r[3] = wr(m,ivz,k,j,i);
+  u_r[0] = sqrt(1.0 + SQR(u_r[1]) + SQR(u_r[2]) + SQR(u_r[3]));
+  Real bb2_r = br(m,iby,k,j,i);
+  Real bb3_r = br(m,ibz,k,j,i);
 
-    Real pgas_l = eos.IdealGasPressure(wl(IEN,i));
-    Real pgas_r = eos.IdealGasPressure(wr(IEN,i));
+  Real pgas_l = eos.IdealGasPressure(wl(m,IEN,k,j,i));
+  Real pgas_r = eos.IdealGasPressure(wr(m,IEN,k,j,i));
 
-    // Normal magnetic field (continuous across the interface)
-    Real bbx = bx(m,k,j,i);
+  // Normal magnetic field (continuous across the interface)
+  Real bbx = bx(m,k,j,i);
 
-    // 4-magnetic field, left
-    Real b_l[4];
-    b_l[0] = bbx*u_l[1] + bb2_l*u_l[2] + bb3_l*u_l[3];
-    b_l[1] = (bbx   + b_l[0]*u_l[1])/u_l[0];
-    b_l[2] = (bb2_l + b_l[0]*u_l[2])/u_l[0];
-    b_l[3] = (bb3_l + b_l[0]*u_l[3])/u_l[0];
-    Real b_sq_l = -SQR(b_l[0]) + SQR(b_l[1]) + SQR(b_l[2]) + SQR(b_l[3]);
+  // 4-magnetic field, left
+  Real b_l[4];
+  b_l[0] = bbx*u_l[1] + bb2_l*u_l[2] + bb3_l*u_l[3];
+  b_l[1] = (bbx   + b_l[0]*u_l[1])/u_l[0];
+  b_l[2] = (bb2_l + b_l[0]*u_l[2])/u_l[0];
+  b_l[3] = (bb3_l + b_l[0]*u_l[3])/u_l[0];
+  Real b_sq_l = -SQR(b_l[0]) + SQR(b_l[1]) + SQR(b_l[2]) + SQR(b_l[3]);
 
-    // 4-magnetic field, right
-    Real b_r[4];
-    b_r[0] = bbx*u_r[1] + bb2_r*u_r[2] + bb3_r*u_r[3];
-    b_r[1] = (bbx   + b_r[0]*u_r[1])/u_r[0];
-    b_r[2] = (bb2_r + b_r[0]*u_r[2])/u_r[0];
-    b_r[3] = (bb3_r + b_r[0]*u_r[3])/u_r[0];
-    Real b_sq_r = -SQR(b_r[0]) + SQR(b_r[1]) + SQR(b_r[2]) + SQR(b_r[3]);
+  // 4-magnetic field, right
+  Real b_r[4];
+  b_r[0] = bbx*u_r[1] + bb2_r*u_r[2] + bb3_r*u_r[3];
+  b_r[1] = (bbx   + b_r[0]*u_r[1])/u_r[0];
+  b_r[2] = (bb2_r + b_r[0]*u_r[2])/u_r[0];
+  b_r[3] = (bb3_r + b_r[0]*u_r[3])/u_r[0];
+  Real b_sq_r = -SQR(b_r[0]) + SQR(b_r[1]) + SQR(b_r[2]) + SQR(b_r[3]);
 
-    // Fast-magnetosonic speeds and the extremal wavespeeds (MB 55)
-    Real lm_l, lp_l, lm_r, lp_r;
-    eos.IdealSRMHDFastSpeeds(rho_l, pgas_l, u_l[1], u_l[0], b_sq_l, lp_l, lm_l);
-    eos.IdealSRMHDFastSpeeds(rho_r, pgas_r, u_r[1], u_r[0], b_sq_r, lp_r, lm_r);
-    Real lambda_l = fmin(lm_l, lm_r);
-    Real lambda_r = fmax(lp_l, lp_r);
+  // Fast-magnetosonic speeds and the extremal wavespeeds (MB 55)
+  Real lm_l, lp_l, lm_r, lp_r;
+  eos.IdealSRMHDFastSpeeds(rho_l, pgas_l, u_l[1], u_l[0], b_sq_l, lp_l, lm_l);
+  eos.IdealSRMHDFastSpeeds(rho_r, pgas_r, u_r[1], u_r[0], b_sq_r, lp_r, lm_r);
+  Real lambda_l = fmin(lm_l, lm_r);
+  Real lambda_r = fmax(lp_l, lp_r);
 
-    // Conserved state and flux, L region (MUB 8, 15).  Note `.e` is the FULL energy E
-    // (rest mass included); the conversion to tau = E - D happens at the very end.
-    MHDCons1D consl, fl;
-    Real wtot_l = rho_l + gamma_prime*pgas_l + b_sq_l;
-    Real ptot_l = pgas_l + 0.5*b_sq_l;
-    consl.d  = rho_l*u_l[0];
-    consl.e  = wtot_l*u_l[0]*u_l[0] - b_l[0]*b_l[0] - ptot_l;
-    consl.mx = wtot_l*u_l[1]*u_l[0] - b_l[1]*b_l[0];
-    consl.my = wtot_l*u_l[2]*u_l[0] - b_l[2]*b_l[0];
-    consl.mz = wtot_l*u_l[3]*u_l[0] - b_l[3]*b_l[0];
-    consl.by = b_l[2]*u_l[0] - b_l[0]*u_l[2];
-    consl.bz = b_l[3]*u_l[0] - b_l[0]*u_l[3];
-    fl.d  = rho_l*u_l[1];
-    fl.e  = wtot_l*u_l[0]*u_l[1] - b_l[0]*b_l[1];
-    fl.mx = wtot_l*u_l[1]*u_l[1] - b_l[1]*b_l[1] + ptot_l;
-    fl.my = wtot_l*u_l[2]*u_l[1] - b_l[2]*b_l[1];
-    fl.mz = wtot_l*u_l[3]*u_l[1] - b_l[3]*b_l[1];
-    fl.by = b_l[2]*u_l[1] - b_l[1]*u_l[2];
-    fl.bz = b_l[3]*u_l[1] - b_l[1]*u_l[3];
+  // Conserved state and flux, L region (MUB 8, 15).  Note `.e` is the FULL energy E
+  // (rest mass included); the conversion to tau = E - D happens at the very end.
+  MHDCons1D consl, fl;
+  Real wtot_l = rho_l + gamma_prime*pgas_l + b_sq_l;
+  Real ptot_l = pgas_l + 0.5*b_sq_l;
+  consl.d  = rho_l*u_l[0];
+  consl.e  = wtot_l*u_l[0]*u_l[0] - b_l[0]*b_l[0] - ptot_l;
+  consl.mx = wtot_l*u_l[1]*u_l[0] - b_l[1]*b_l[0];
+  consl.my = wtot_l*u_l[2]*u_l[0] - b_l[2]*b_l[0];
+  consl.mz = wtot_l*u_l[3]*u_l[0] - b_l[3]*b_l[0];
+  consl.by = b_l[2]*u_l[0] - b_l[0]*u_l[2];
+  consl.bz = b_l[3]*u_l[0] - b_l[0]*u_l[3];
+  fl.d  = rho_l*u_l[1];
+  fl.e  = wtot_l*u_l[0]*u_l[1] - b_l[0]*b_l[1];
+  fl.mx = wtot_l*u_l[1]*u_l[1] - b_l[1]*b_l[1] + ptot_l;
+  fl.my = wtot_l*u_l[2]*u_l[1] - b_l[2]*b_l[1];
+  fl.mz = wtot_l*u_l[3]*u_l[1] - b_l[3]*b_l[1];
+  fl.by = b_l[2]*u_l[1] - b_l[1]*u_l[2];
+  fl.bz = b_l[3]*u_l[1] - b_l[1]*u_l[3];
 
-    // Conserved state and flux, R region (MUB 8, 15)
-    MHDCons1D consr, fr;
-    Real wtot_r = rho_r + gamma_prime*pgas_r + b_sq_r;
-    Real ptot_r = pgas_r + 0.5*b_sq_r;
-    consr.d  = rho_r*u_r[0];
-    consr.e  = wtot_r*u_r[0]*u_r[0] - b_r[0]*b_r[0] - ptot_r;
-    consr.mx = wtot_r*u_r[1]*u_r[0] - b_r[1]*b_r[0];
-    consr.my = wtot_r*u_r[2]*u_r[0] - b_r[2]*b_r[0];
-    consr.mz = wtot_r*u_r[3]*u_r[0] - b_r[3]*b_r[0];
-    consr.by = b_r[2]*u_r[0] - b_r[0]*u_r[2];
-    consr.bz = b_r[3]*u_r[0] - b_r[0]*u_r[3];
-    fr.d  = rho_r*u_r[1];
-    fr.e  = wtot_r*u_r[0]*u_r[1] - b_r[0]*b_r[1];
-    fr.mx = wtot_r*u_r[1]*u_r[1] - b_r[1]*b_r[1] + ptot_r;
-    fr.my = wtot_r*u_r[2]*u_r[1] - b_r[2]*b_r[1];
-    fr.mz = wtot_r*u_r[3]*u_r[1] - b_r[3]*b_r[1];
-    fr.by = b_r[2]*u_r[1] - b_r[1]*u_r[2];
-    fr.bz = b_r[3]*u_r[1] - b_r[1]*u_r[3];
+  // Conserved state and flux, R region (MUB 8, 15)
+  MHDCons1D consr, fr;
+  Real wtot_r = rho_r + gamma_prime*pgas_r + b_sq_r;
+  Real ptot_r = pgas_r + 0.5*b_sq_r;
+  consr.d  = rho_r*u_r[0];
+  consr.e  = wtot_r*u_r[0]*u_r[0] - b_r[0]*b_r[0] - ptot_r;
+  consr.mx = wtot_r*u_r[1]*u_r[0] - b_r[1]*b_r[0];
+  consr.my = wtot_r*u_r[2]*u_r[0] - b_r[2]*b_r[0];
+  consr.mz = wtot_r*u_r[3]*u_r[0] - b_r[3]*b_r[0];
+  consr.by = b_r[2]*u_r[0] - b_r[0]*u_r[2];
+  consr.bz = b_r[3]*u_r[0] - b_r[0]*u_r[3];
+  fr.d  = rho_r*u_r[1];
+  fr.e  = wtot_r*u_r[0]*u_r[1] - b_r[0]*b_r[1];
+  fr.mx = wtot_r*u_r[1]*u_r[1] - b_r[1]*b_r[1] + ptot_r;
+  fr.my = wtot_r*u_r[2]*u_r[1] - b_r[2]*b_r[1];
+  fr.mz = wtot_r*u_r[3]*u_r[1] - b_r[3]*b_r[1];
+  fr.by = b_r[2]*u_r[1] - b_r[1]*u_r[2];
+  fr.bz = b_r[3]*u_r[1] - b_r[1]*u_r[3];
 
-    // Jump vectors across each fast wave, R = lambda*U - F (MUB 12)
-    MHDCons1D rl, rr;
-    rl.d  = lambda_l*consl.d  - fl.d;
-    rl.e  = lambda_l*consl.e  - fl.e;
-    rl.mx = lambda_l*consl.mx - fl.mx;
-    rl.my = lambda_l*consl.my - fl.my;
-    rl.mz = lambda_l*consl.mz - fl.mz;
-    rl.by = lambda_l*consl.by - fl.by;
-    rl.bz = lambda_l*consl.bz - fl.bz;
-    rr.d  = lambda_r*consr.d  - fr.d;
-    rr.e  = lambda_r*consr.e  - fr.e;
-    rr.mx = lambda_r*consr.mx - fr.mx;
-    rr.my = lambda_r*consr.my - fr.my;
-    rr.mz = lambda_r*consr.mz - fr.mz;
-    rr.by = lambda_r*consr.by - fr.by;
-    rr.bz = lambda_r*consr.bz - fr.bz;
+  // Jump vectors across each fast wave, R = lambda*U - F (MUB 12)
+  MHDCons1D rl, rr;
+  rl.d  = lambda_l*consl.d  - fl.d;
+  rl.e  = lambda_l*consl.e  - fl.e;
+  rl.mx = lambda_l*consl.mx - fl.mx;
+  rl.my = lambda_l*consl.my - fl.my;
+  rl.mz = lambda_l*consl.mz - fl.mz;
+  rl.by = lambda_l*consl.by - fl.by;
+  rl.bz = lambda_l*consl.bz - fl.bz;
+  rr.d  = lambda_r*consr.d  - fr.d;
+  rr.e  = lambda_r*consr.e  - fr.e;
+  rr.mx = lambda_r*consr.mx - fr.mx;
+  rr.my = lambda_r*consr.my - fr.my;
+  rr.mz = lambda_r*consr.mz - fr.mz;
+  rr.by = lambda_r*consr.by - fr.by;
+  rr.bz = lambda_r*consr.bz - fr.bz;
 
-    // HLL average state (MB 29) and flux (MB 31)
-    MHDCons1D cons_hll, flux_hll;
-    Real ldiff_inv = 1.0/(lambda_r - lambda_l);
-    cons_hll.d  = (rr.d  - rl.d )*ldiff_inv;
-    cons_hll.e  = (rr.e  - rl.e )*ldiff_inv;
-    cons_hll.mx = (rr.mx - rl.mx)*ldiff_inv;
-    cons_hll.my = (rr.my - rl.my)*ldiff_inv;
-    cons_hll.mz = (rr.mz - rl.mz)*ldiff_inv;
-    cons_hll.by = (rr.by - rl.by)*ldiff_inv;
-    cons_hll.bz = (rr.bz - rl.bz)*ldiff_inv;
-    flux_hll.d  = (lambda_l*rr.d  - lambda_r*rl.d )*ldiff_inv;
-    flux_hll.e  = (lambda_l*rr.e  - lambda_r*rl.e )*ldiff_inv;
-    flux_hll.mx = (lambda_l*rr.mx - lambda_r*rl.mx)*ldiff_inv;
-    flux_hll.my = (lambda_l*rr.my - lambda_r*rl.my)*ldiff_inv;
-    flux_hll.mz = (lambda_l*rr.mz - lambda_r*rl.mz)*ldiff_inv;
-    flux_hll.by = (lambda_l*rr.by - lambda_r*rl.by)*ldiff_inv;
-    flux_hll.bz = (lambda_l*rr.bz - lambda_r*rl.bz)*ldiff_inv;
+  // HLL average state (MB 29) and flux (MB 31)
+  MHDCons1D cons_hll, flux_hll;
+  Real ldiff_inv = 1.0/(lambda_r - lambda_l);
+  cons_hll.d  = (rr.d  - rl.d )*ldiff_inv;
+  cons_hll.e  = (rr.e  - rl.e )*ldiff_inv;
+  cons_hll.mx = (rr.mx - rl.mx)*ldiff_inv;
+  cons_hll.my = (rr.my - rl.my)*ldiff_inv;
+  cons_hll.mz = (rr.mz - rl.mz)*ldiff_inv;
+  cons_hll.by = (rr.by - rl.by)*ldiff_inv;
+  cons_hll.bz = (rr.bz - rl.bz)*ldiff_inv;
+  flux_hll.d  = (lambda_l*rr.d  - lambda_r*rl.d )*ldiff_inv;
+  flux_hll.e  = (lambda_l*rr.e  - lambda_r*rl.e )*ldiff_inv;
+  flux_hll.mx = (lambda_l*rr.mx - lambda_r*rl.mx)*ldiff_inv;
+  flux_hll.my = (lambda_l*rr.my - lambda_r*rl.my)*ldiff_inv;
+  flux_hll.mz = (lambda_l*rr.mz - lambda_r*rl.mz)*ldiff_inv;
+  flux_hll.by = (lambda_l*rr.by - lambda_r*rl.by)*ldiff_inv;
+  flux_hll.bz = (lambda_l*rr.bz - lambda_r*rl.bz)*ldiff_inv;
 
-    bool use_hlle = false;
+  bool use_hlle = false;
 
-    // ----------------------------------------- total pressure of the HLL average state
-    Real ptot_hll;
-    {
-      Real m_sq  = SQR(cons_hll.mx) + SQR(cons_hll.my) + SQR(cons_hll.mz);
-      Real bb_sq = SQR(bbx) + SQR(cons_hll.by) + SQR(cons_hll.bz);
-      Real m_dot_bb = cons_hll.mx*bbx + cons_hll.my*cons_hll.by
-                      + cons_hll.mz*cons_hll.bz;
-      Real ss_sq = SQR(m_dot_bb);
+  // ----------------------------------------- total pressure of the HLL average state
+  Real ptot_hll;
+  {
+    Real m_sq  = SQR(cons_hll.mx) + SQR(cons_hll.my) + SQR(cons_hll.mz);
+    Real bb_sq = SQR(bbx) + SQR(cons_hll.by) + SQR(cons_hll.bz);
+    Real m_dot_bb = cons_hll.mx*bbx + cons_hll.my*cons_hll.by
+                    + cons_hll.mz*cons_hll.bz;
+    Real ss_sq = SQR(m_dot_bb);
 
-      // Initial guess for the total enthalpy W (MM A26-A27)
-      Real a1 = 4.0/3.0*(bb_sq - cons_hll.e);
-      Real a0 = (1.0/3.0)*(m_sq + bb_sq*(bb_sq - 2.0*cons_hll.e));
-      Real s2 = SQR(a1) - 4.0*a0;
-      Real ss = (s2 < 0.0) ? 0.0 : sqrt(s2);
-      Real w  = (s2 >= 0.0 && a1 >= 0.0) ? -2.0*a0/(a1 + ss) : 0.5*(-a1 + ss);
+    // Initial guess for the total enthalpy W (MM A26-A27)
+    Real a1 = 4.0/3.0*(bb_sq - cons_hll.e);
+    Real a0 = (1.0/3.0)*(m_sq + bb_sq*(bb_sq - 2.0*cons_hll.e));
+    Real s2 = SQR(a1) - 4.0*a0;
+    Real ss = (s2 < 0.0) ? 0.0 : sqrt(s2);
+    Real w  = (s2 >= 0.0 && a1 >= 0.0) ? -2.0*a0/(a1 + ss) : 0.5*(-a1 + ss);
 
-      // A couple of Newton-Raphson steps are enough for an initial estimate
-      Real res = SREResidual(w, cons_hll.d, cons_hll.e, m_sq, bb_sq, ss_sq, gamma_prime);
-      for (int n = 0; n < num_nr; ++n) {
-        Real deriv = SREResidualPrime(w, cons_hll.d, m_sq, bb_sq, ss_sq, gamma_prime);
-        w  -= res/deriv;
-        res = SREResidual(w, cons_hll.d, cons_hll.e, m_sq, bb_sq, ss_sq, gamma_prime);
-      }
-
-      // Primitives from W (MM A3, A10, A11, A17), then the total pressure (MM 2)
-      Real v_sq   = (m_sq + ss_sq/SQR(w)*(2.0*w + bb_sq))/SQR(w + bb_sq);
-      Real lor_sq = 1.0/(1.0 - v_sq);
-      Real chi    = (1.0 - v_sq)*(w - sqrt(lor_sq)*cons_hll.d);
-      Real pgas   = chi/gamma_prime;
-      Real vx = (cons_hll.mx + m_dot_bb/w*bbx)/(w + bb_sq);
-      Real vy = (cons_hll.my + m_dot_bb/w*cons_hll.by)/(w + bb_sq);
-      Real vz = (cons_hll.mz + m_dot_bb/w*cons_hll.bz)/(w + bb_sq);
-      Real v_bb = vx*bbx + vy*cons_hll.by + vz*cons_hll.bz;
-      ptot_hll = pgas + 0.5*(bb_sq/lor_sq + SQR(v_bb));
+    // A couple of Newton-Raphson steps are enough for an initial estimate
+    Real res = SREResidual(w, cons_hll.d, cons_hll.e, m_sq, bb_sq, ss_sq, gamma_prime);
+    for (int n = 0; n < num_nr; ++n) {
+      Real deriv = SREResidualPrime(w, cons_hll.d, m_sq, bb_sq, ss_sq, gamma_prime);
+      w  -= res/deriv;
+      res = SREResidual(w, cons_hll.d, cons_hll.e, m_sq, bb_sq, ss_sq, gamma_prime);
     }
 
-    // ------------------------------------------- initial guess for the fan pressure
-    Real ptot_init;
-    if (SQR(bbx)/ptot_hll < p_transition) {   // weak field: quadratic estimate (MUB 55)
-      Real a1 = cons_hll.e - flux_hll.mx;
-      Real a0 = cons_hll.mx*flux_hll.e - flux_hll.mx*cons_hll.e;
-      Real s2 = SQR(a1) - 4.0*a0;
-      Real ss = (s2 < 0.0) ? 0.0 : sqrt(s2);
-      ptot_init = (s2 >= 0.0 && a1 >= 0.0) ? -2.0*a0/(a1 + ss) : 0.5*(-a1 + ss);
-    } else {                                  // strong field (MUB 53)
-      ptot_init = ptot_hll;
-    }
-    if (!Kokkos::isfinite(ptot_init) || ptot_init <= 0.0) use_hlle = true;
+    // Primitives from W (MM A3, A10, A11, A17), then the total pressure (MM 2)
+    Real v_sq   = (m_sq + ss_sq/SQR(w)*(2.0*w + bb_sq))/SQR(w + bb_sq);
+    Real lor_sq = 1.0/(1.0 - v_sq);
+    Real chi    = (1.0 - v_sq)*(w - sqrt(lor_sq)*cons_hll.d);
+    Real pgas   = chi/gamma_prime;
+    Real vx = (cons_hll.mx + m_dot_bb/w*bbx)/(w + bb_sq);
+    Real vy = (cons_hll.my + m_dot_bb/w*cons_hll.by)/(w + bb_sq);
+    Real vz = (cons_hll.mz + m_dot_bb/w*cons_hll.bz)/(w + bb_sq);
+    Real v_bb = vx*bbx + vy*cons_hll.by + vz*cons_hll.bz;
+    ptot_hll = pgas + 0.5*(bb_sq/lor_sq + SQR(v_bb));
+  }
 
-    // ------------------------------------------------ secant iteration on MUB (48)
-    HLLDFan s;
-    Real ptot_c = ptot_init;
-    if (!use_hlle) {
-      Real tol_ptot = 1.0e-8*ptot_init;
-      Real p_last = ptot_init;
-      Real r_last = SRHLLDResidual(p_last, bbx, lambda_l, lambda_r, rl, rr,
-                                   delta_kx_aug, s);
-      Real p_n = ptot_init*(1.0 + initial_offset);
-      Real r_n = SRHLLDResidual(p_n, bbx, lambda_l, lambda_r, rl, rr, delta_kx_aug, s);
+  // ------------------------------------------- initial guess for the fan pressure
+  Real ptot_init;
+  if (SQR(bbx)/ptot_hll < p_transition) {   // weak field: quadratic estimate (MUB 55)
+    Real a1 = cons_hll.e - flux_hll.mx;
+    Real a0 = cons_hll.mx*flux_hll.e - flux_hll.mx*cons_hll.e;
+    Real s2 = SQR(a1) - 4.0*a0;
+    Real ss = (s2 < 0.0) ? 0.0 : sqrt(s2);
+    ptot_init = (s2 >= 0.0 && a1 >= 0.0) ? -2.0*a0/(a1 + ss) : 0.5*(-a1 + ss);
+  } else {                                  // strong field (MUB 53)
+    ptot_init = ptot_hll;
+  }
+  if (!Kokkos::isfinite(ptot_init) || ptot_init <= 0.0) use_hlle = true;
 
-      for (int n = 0; n < num_secant; ++n) {
-        Real p_old = p_last;
-        Real r_old = r_last;
-        p_last = p_n;
-        r_last = r_n;
-        if (fabs(r_last) > tol_res && fabs(p_last - p_old) > tol_ptot) {
-          p_n = (r_last*p_old - r_old*p_last)/(r_last - r_old);
-        } else {
-          p_n = p_last;
-        }
-        r_n = SRHLLDResidual(p_n, bbx, lambda_l, lambda_r, rl, rr, delta_kx_aug, s);
-      }
-      ptot_c = p_n;
+  // ------------------------------------------------ secant iteration on MUB (48)
+  HLLDFan s;
+  Real ptot_c = ptot_init;
+  if (!use_hlle) {
+    Real tol_ptot = 1.0e-8*ptot_init;
+    Real p_last = ptot_init;
+    Real r_last = SRHLLDResidual(p_last, bbx, lambda_l, lambda_r, rl, rr,
+                                 delta_kx_aug, s);
+    Real p_n = ptot_init*(1.0 + initial_offset);
+    Real r_n = SRHLLDResidual(p_n, bbx, lambda_l, lambda_r, rl, rr, delta_kx_aug, s);
 
-      if (!Kokkos::isfinite(s.lambda_al) || !Kokkos::isfinite(s.lambda_ar) ||
-          !Kokkos::isfinite(ptot_c) || ptot_c <= 0.0) {
-        use_hlle = true;
-      }
-    }
-
-    // ------------------------------------------------------- assemble the wave fan
-    MHDCons1D cons_al, cons_ar, flux_al, flux_ar, cons_c, flux_c;
-    Real vx_c = 0.0;
-    if (!use_hlle) {
-      // aL region (MUB 32, 33, 34)
-      Real v_bb_al = s.vx_al*bbx + s.vy_al*s.by_al + s.vz_al*s.bz_al;
-      cons_al.by = s.by_al;
-      cons_al.bz = s.bz_al;
-      cons_al.d  = rl.d/(lambda_l - s.vx_al);
-      cons_al.e  = (rl.e + ptot_c*s.vx_al - v_bb_al*bbx)/(lambda_l - s.vx_al);
-      cons_al.mx = (cons_al.e + ptot_c)*s.vx_al - v_bb_al*bbx;
-      cons_al.my = (cons_al.e + ptot_c)*s.vy_al - v_bb_al*cons_al.by;
-      cons_al.mz = (cons_al.e + ptot_c)*s.vz_al - v_bb_al*cons_al.bz;
-
-      // aR region
-      Real v_bb_ar = s.vx_ar*bbx + s.vy_ar*s.by_ar + s.vz_ar*s.bz_ar;
-      cons_ar.by = s.by_ar;
-      cons_ar.bz = s.bz_ar;
-      cons_ar.d  = rr.d/(lambda_r - s.vx_ar);
-      cons_ar.e  = (rr.e + ptot_c*s.vx_ar - v_bb_ar*bbx)/(lambda_r - s.vx_ar);
-      cons_ar.mx = (cons_ar.e + ptot_c)*s.vx_ar - v_bb_ar*bbx;
-      cons_ar.my = (cons_ar.e + ptot_c)*s.vy_ar - v_bb_ar*cons_ar.by;
-      cons_ar.mz = (cons_ar.e + ptot_c)*s.vz_ar - v_bb_ar*cons_ar.bz;
-
-      // Fluxes in the a regions (MUB 11, 12)
-      flux_al.d  = lambda_l*cons_al.d  - rl.d;
-      flux_al.e  = lambda_l*cons_al.e  - rl.e;
-      flux_al.mx = lambda_l*cons_al.mx - rl.mx;
-      flux_al.my = lambda_l*cons_al.my - rl.my;
-      flux_al.mz = lambda_l*cons_al.mz - rl.mz;
-      flux_al.by = lambda_l*cons_al.by - rl.by;
-      flux_al.bz = lambda_l*cons_al.bz - rl.bz;
-      flux_ar.d  = lambda_r*cons_ar.d  - rr.d;
-      flux_ar.e  = lambda_r*cons_ar.e  - rr.e;
-      flux_ar.mx = lambda_r*cons_ar.mx - rr.mx;
-      flux_ar.my = lambda_r*cons_ar.my - rr.my;
-      flux_ar.mz = lambda_r*cons_ar.mz - rr.mz;
-      flux_ar.by = lambda_r*cons_ar.by - rr.by;
-      flux_ar.bz = lambda_r*cons_ar.bz - rr.bz;
-
-      // Transverse field in the contact region (MUB 45)
-      Real denom_c_inv = 1.0/(s.lambda_ar - s.lambda_al + delta_kx_aug);
-      Real numer_al = cons_al.by*(s.lambda_al - s.vx_al) + bbx*s.vy_al;
-      Real numer_ar = cons_ar.by*(s.lambda_ar - s.vx_ar) + bbx*s.vy_ar;
-      cons_c.by = (numer_ar - numer_al)*denom_c_inv;
-      numer_al = cons_al.bz*(s.lambda_al - s.vx_al) + bbx*s.vz_al;
-      numer_ar = cons_ar.bz*(s.lambda_ar - s.vx_ar) + bbx*s.vz_ar;
-      cons_c.bz = (numer_ar - numer_al)*denom_c_inv;
-
-      // Contact velocity (MUB 47), averaging the two one-sided estimates
-      Real k_sq_l = SQR(s.kx_l) + SQR(s.ky_l) + SQR(s.kz_l);
-      Real k_bc_l = s.kx_l*bbx + s.ky_l*cons_c.by + s.kz_l*cons_c.bz;
-      Real f_l    = (1.0 - k_sq_l)/(s.eta_l - k_bc_l);
-      Real k_sq_r = SQR(s.kx_r) + SQR(s.ky_r) + SQR(s.kz_r);
-      Real k_bc_r = s.kx_r*bbx + s.ky_r*cons_c.by + s.kz_r*cons_c.bz;
-      Real f_r    = (1.0 - k_sq_r)/(s.eta_r - k_bc_r);
-      vx_c = 0.5*((s.kx_l - bbx*f_l)       + (s.kx_r - bbx*f_r));
-      Real vy_c = 0.5*((s.ky_l - cons_c.by*f_l) + (s.ky_r - cons_c.by*f_r));
-      Real vz_c = 0.5*((s.kz_l - cons_c.bz*f_l) + (s.kz_r - cons_c.bz*f_r));
-
-      // Remaining conserved quantities in the contact region (MUB 50, 51, 52)
-      Real v_bb_c = vx_c*bbx + vy_c*cons_c.by + vz_c*cons_c.bz;
-      if (vx_c >= 0.0) {   // cL
-        cons_c.d = cons_al.d*(s.lambda_al - s.vx_al)/(s.lambda_al - vx_c);
-        cons_c.e = (s.lambda_al*cons_al.e - cons_al.mx + ptot_c*vx_c - v_bb_c*bbx)
-                   /(s.lambda_al - vx_c);
-      } else {             // cR
-        cons_c.d = cons_ar.d*(s.lambda_ar - s.vx_ar)/(s.lambda_ar - vx_c);
-        cons_c.e = (s.lambda_ar*cons_ar.e - cons_ar.mx + ptot_c*vx_c - v_bb_c*bbx)
-                   /(s.lambda_ar - vx_c);
-      }
-      cons_c.mx = (cons_c.e + ptot_c)*vx_c - v_bb_c*bbx;
-      cons_c.my = (cons_c.e + ptot_c)*vy_c - v_bb_c*cons_c.by;
-      cons_c.mz = (cons_c.e + ptot_c)*vz_c - v_bb_c*cons_c.bz;
-
-      // Fluxes in the contact region (MUB 11)
-      if (vx_c >= 0.0) {
-        flux_c.d  = flux_al.d  + s.lambda_al*(cons_c.d  - cons_al.d );
-        flux_c.e  = flux_al.e  + s.lambda_al*(cons_c.e  - cons_al.e );
-        flux_c.mx = flux_al.mx + s.lambda_al*(cons_c.mx - cons_al.mx);
-        flux_c.my = flux_al.my + s.lambda_al*(cons_c.my - cons_al.my);
-        flux_c.mz = flux_al.mz + s.lambda_al*(cons_c.mz - cons_al.mz);
-        flux_c.by = flux_al.by + s.lambda_al*(cons_c.by - cons_al.by);
-        flux_c.bz = flux_al.bz + s.lambda_al*(cons_c.bz - cons_al.bz);
+    for (int n = 0; n < num_secant; ++n) {
+      Real p_old = p_last;
+      Real r_old = r_last;
+      p_last = p_n;
+      r_last = r_n;
+      if (fabs(r_last) > tol_res && fabs(p_last - p_old) > tol_ptot) {
+        p_n = (r_last*p_old - r_old*p_last)/(r_last - r_old);
       } else {
-        flux_c.d  = flux_ar.d  + s.lambda_ar*(cons_c.d  - cons_ar.d );
-        flux_c.e  = flux_ar.e  + s.lambda_ar*(cons_c.e  - cons_ar.e );
-        flux_c.mx = flux_ar.mx + s.lambda_ar*(cons_c.mx - cons_ar.mx);
-        flux_c.my = flux_ar.my + s.lambda_ar*(cons_c.my - cons_ar.my);
-        flux_c.mz = flux_ar.mz + s.lambda_ar*(cons_c.mz - cons_ar.mz);
-        flux_c.by = flux_ar.by + s.lambda_ar*(cons_c.by - cons_ar.by);
-        flux_c.bz = flux_ar.bz + s.lambda_ar*(cons_c.bz - cons_ar.bz);
+        p_n = p_last;
       }
+      r_n = SRHLLDResidual(p_n, bbx, lambda_l, lambda_r, rl, rr, delta_kx_aug, s);
     }
+    ptot_c = p_n;
 
-    // ------------------------------------------------------------- select the region
-    MHDCons1D *fi;
-    if (lambda_l >= 0.0) {                          // L
-      fi = &fl;
-    } else if (lambda_r <= 0.0) {                   // R
-      fi = &fr;
-    } else if (use_hlle) {                          // HLL fallback
-      fi = &flux_hll;
-    } else if (s.lambda_al >= -vc_extension) {      // aL
-      fi = &flux_al;
-    } else if (s.lambda_ar <= vc_extension) {       // aR
-      fi = &flux_ar;
-    } else {                                        // c
-      fi = &flux_c;
+    if (!Kokkos::isfinite(s.lambda_al) || !Kokkos::isfinite(s.lambda_ar) ||
+        !Kokkos::isfinite(ptot_c) || ptot_c <= 0.0) {
+      use_hlle = true;
     }
+  }
 
-    // Guard against any non-finite value produced by the HLLD branch
-    if (!Kokkos::isfinite(fi->d) || !Kokkos::isfinite(fi->e)  ||
-        !Kokkos::isfinite(fi->mx)|| !Kokkos::isfinite(fi->my) ||
-        !Kokkos::isfinite(fi->mz)|| !Kokkos::isfinite(fi->by) ||
-        !Kokkos::isfinite(fi->bz)) {
-      fi = &flux_hll;
+  // ------------------------------------------------------- assemble the wave fan
+  MHDCons1D cons_al, cons_ar, flux_al, flux_ar, cons_c, flux_c;
+  Real vx_c = 0.0;
+  if (!use_hlle) {
+    // aL region (MUB 32, 33, 34)
+    Real v_bb_al = s.vx_al*bbx + s.vy_al*s.by_al + s.vz_al*s.bz_al;
+    cons_al.by = s.by_al;
+    cons_al.bz = s.bz_al;
+    cons_al.d  = rl.d/(lambda_l - s.vx_al);
+    cons_al.e  = (rl.e + ptot_c*s.vx_al - v_bb_al*bbx)/(lambda_l - s.vx_al);
+    cons_al.mx = (cons_al.e + ptot_c)*s.vx_al - v_bb_al*bbx;
+    cons_al.my = (cons_al.e + ptot_c)*s.vy_al - v_bb_al*cons_al.by;
+    cons_al.mz = (cons_al.e + ptot_c)*s.vz_al - v_bb_al*cons_al.bz;
+
+    // aR region
+    Real v_bb_ar = s.vx_ar*bbx + s.vy_ar*s.by_ar + s.vz_ar*s.bz_ar;
+    cons_ar.by = s.by_ar;
+    cons_ar.bz = s.bz_ar;
+    cons_ar.d  = rr.d/(lambda_r - s.vx_ar);
+    cons_ar.e  = (rr.e + ptot_c*s.vx_ar - v_bb_ar*bbx)/(lambda_r - s.vx_ar);
+    cons_ar.mx = (cons_ar.e + ptot_c)*s.vx_ar - v_bb_ar*bbx;
+    cons_ar.my = (cons_ar.e + ptot_c)*s.vy_ar - v_bb_ar*cons_ar.by;
+    cons_ar.mz = (cons_ar.e + ptot_c)*s.vz_ar - v_bb_ar*cons_ar.bz;
+
+    // Fluxes in the a regions (MUB 11, 12)
+    flux_al.d  = lambda_l*cons_al.d  - rl.d;
+    flux_al.e  = lambda_l*cons_al.e  - rl.e;
+    flux_al.mx = lambda_l*cons_al.mx - rl.mx;
+    flux_al.my = lambda_l*cons_al.my - rl.my;
+    flux_al.mz = lambda_l*cons_al.mz - rl.mz;
+    flux_al.by = lambda_l*cons_al.by - rl.by;
+    flux_al.bz = lambda_l*cons_al.bz - rl.bz;
+    flux_ar.d  = lambda_r*cons_ar.d  - rr.d;
+    flux_ar.e  = lambda_r*cons_ar.e  - rr.e;
+    flux_ar.mx = lambda_r*cons_ar.mx - rr.mx;
+    flux_ar.my = lambda_r*cons_ar.my - rr.my;
+    flux_ar.mz = lambda_r*cons_ar.mz - rr.mz;
+    flux_ar.by = lambda_r*cons_ar.by - rr.by;
+    flux_ar.bz = lambda_r*cons_ar.bz - rr.bz;
+
+    // Transverse field in the contact region (MUB 45)
+    Real denom_c_inv = 1.0/(s.lambda_ar - s.lambda_al + delta_kx_aug);
+    Real numer_al = cons_al.by*(s.lambda_al - s.vx_al) + bbx*s.vy_al;
+    Real numer_ar = cons_ar.by*(s.lambda_ar - s.vx_ar) + bbx*s.vy_ar;
+    cons_c.by = (numer_ar - numer_al)*denom_c_inv;
+    numer_al = cons_al.bz*(s.lambda_al - s.vx_al) + bbx*s.vz_al;
+    numer_ar = cons_ar.bz*(s.lambda_ar - s.vx_ar) + bbx*s.vz_ar;
+    cons_c.bz = (numer_ar - numer_al)*denom_c_inv;
+
+    // Contact velocity (MUB 47), averaging the two one-sided estimates
+    Real k_sq_l = SQR(s.kx_l) + SQR(s.ky_l) + SQR(s.kz_l);
+    Real k_bc_l = s.kx_l*bbx + s.ky_l*cons_c.by + s.kz_l*cons_c.bz;
+    Real f_l    = (1.0 - k_sq_l)/(s.eta_l - k_bc_l);
+    Real k_sq_r = SQR(s.kx_r) + SQR(s.ky_r) + SQR(s.kz_r);
+    Real k_bc_r = s.kx_r*bbx + s.ky_r*cons_c.by + s.kz_r*cons_c.bz;
+    Real f_r    = (1.0 - k_sq_r)/(s.eta_r - k_bc_r);
+    vx_c = 0.5*((s.kx_l - bbx*f_l)       + (s.kx_r - bbx*f_r));
+    Real vy_c = 0.5*((s.ky_l - cons_c.by*f_l) + (s.ky_r - cons_c.by*f_r));
+    Real vz_c = 0.5*((s.kz_l - cons_c.bz*f_l) + (s.kz_r - cons_c.bz*f_r));
+
+    // Remaining conserved quantities in the contact region (MUB 50, 51, 52)
+    Real v_bb_c = vx_c*bbx + vy_c*cons_c.by + vz_c*cons_c.bz;
+    if (vx_c >= 0.0) {   // cL
+      cons_c.d = cons_al.d*(s.lambda_al - s.vx_al)/(s.lambda_al - vx_c);
+      cons_c.e = (s.lambda_al*cons_al.e - cons_al.mx + ptot_c*vx_c - v_bb_c*bbx)
+                 /(s.lambda_al - vx_c);
+    } else {             // cR
+      cons_c.d = cons_ar.d*(s.lambda_ar - s.vx_ar)/(s.lambda_ar - vx_c);
+      cons_c.e = (s.lambda_ar*cons_ar.e - cons_ar.mx + ptot_c*vx_c - v_bb_c*bbx)
+                 /(s.lambda_ar - vx_c);
     }
+    cons_c.mx = (cons_c.e + ptot_c)*vx_c - v_bb_c*bbx;
+    cons_c.my = (cons_c.e + ptot_c)*vy_c - v_bb_c*cons_c.by;
+    cons_c.mz = (cons_c.e + ptot_c)*vz_c - v_bb_c*cons_c.bz;
 
-    flx(m,IDN,k,j,i) = fi->d;
-    flx(m,ivx,k,j,i) = fi->mx;
-    flx(m,ivy,k,j,i) = fi->my;
-    flx(m,ivz,k,j,i) = fi->mz;
-    flx(m,IEN,k,j,i) = fi->e;
+    // Fluxes in the contact region (MUB 11)
+    if (vx_c >= 0.0) {
+      flux_c.d  = flux_al.d  + s.lambda_al*(cons_c.d  - cons_al.d );
+      flux_c.e  = flux_al.e  + s.lambda_al*(cons_c.e  - cons_al.e );
+      flux_c.mx = flux_al.mx + s.lambda_al*(cons_c.mx - cons_al.mx);
+      flux_c.my = flux_al.my + s.lambda_al*(cons_c.my - cons_al.my);
+      flux_c.mz = flux_al.mz + s.lambda_al*(cons_c.mz - cons_al.mz);
+      flux_c.by = flux_al.by + s.lambda_al*(cons_c.by - cons_al.by);
+      flux_c.bz = flux_al.bz + s.lambda_al*(cons_c.bz - cons_al.bz);
+    } else {
+      flux_c.d  = flux_ar.d  + s.lambda_ar*(cons_c.d  - cons_ar.d );
+      flux_c.e  = flux_ar.e  + s.lambda_ar*(cons_c.e  - cons_ar.e );
+      flux_c.mx = flux_ar.mx + s.lambda_ar*(cons_c.mx - cons_ar.mx);
+      flux_c.my = flux_ar.my + s.lambda_ar*(cons_c.my - cons_ar.my);
+      flux_c.mz = flux_ar.mz + s.lambda_ar*(cons_c.mz - cons_ar.mz);
+      flux_c.by = flux_ar.by + s.lambda_ar*(cons_c.by - cons_ar.by);
+      flux_c.bz = flux_ar.bz + s.lambda_ar*(cons_c.bz - cons_ar.bz);
+    }
+  }
 
-    ey(m,k,j,i) = -(fi->by);
-    ez(m,k,j,i) =  (fi->bz);
+  // ------------------------------------------------------------- select the region
+  MHDCons1D *fi;
+  if (lambda_l >= 0.0) {                          // L
+    fi = &fl;
+  } else if (lambda_r <= 0.0) {                   // R
+    fi = &fr;
+  } else if (use_hlle) {                          // HLL fallback
+    fi = &flux_hll;
+  } else if (s.lambda_al >= -vc_extension) {      // aL
+    fi = &flux_al;
+  } else if (s.lambda_ar <= vc_extension) {       // aR
+    fi = &flux_ar;
+  } else {                                        // c
+    fi = &flux_c;
+  }
 
-    // We evolve tau = E - D
-    flx(m,IEN,k,j,i) -= flx(m,IDN,k,j,i);
-  });
+  // Guard against any non-finite value produced by the HLLD branch
+  if (!Kokkos::isfinite(fi->d) || !Kokkos::isfinite(fi->e)  ||
+      !Kokkos::isfinite(fi->mx)|| !Kokkos::isfinite(fi->my) ||
+      !Kokkos::isfinite(fi->mz)|| !Kokkos::isfinite(fi->by) ||
+      !Kokkos::isfinite(fi->bz)) {
+    fi = &flux_hll;
+  }
 
+  flx(m,IDN,k,j,i) = fi->d;
+  flx(m,ivx,k,j,i) = fi->mx;
+  flx(m,ivy,k,j,i) = fi->my;
+  flx(m,ivz,k,j,i) = fi->mz;
+  flx(m,IEN,k,j,i) = fi->e;
+
+  ey(m,k,j,i) = -(fi->by);
+  ez(m,k,j,i) =  (fi->bz);
+
+  // We evolve tau = E - D
+  flx(m,IEN,k,j,i) -= flx(m,IDN,k,j,i);
   return;
 }
 } // namespace mhd
