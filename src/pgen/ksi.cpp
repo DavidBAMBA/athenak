@@ -107,6 +107,16 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   int  nz_m   = pin->GetOrAddInteger("problem", "nz", 1);
   // 1 = single mode (Gill+2018 eq. 15), 2 = multimode white noise. See file header.
   int  iprob  = pin->GetOrAddInteger("problem", "iprob", 1);
+  // Restrict the seed to the current sheet with a sech^2(x2/a) envelope instead of
+  // Gill's (1 + cos(2*pi*ny*x2/ly)).  Gill's envelope is nonzero everywhere except the
+  // walls, so it also stirs the magnetically dominated background (beta ~ 1e-17), where
+  // the perturbation drives compressive fast modes that the (unbalanced) background
+  // settling then amplifies.  Measured in a 96x192x48 run at t=6: the far-field density
+  // on an x3 slice reaches +-65% for amp=1e-3 and +-6% for amp=9.5e-7, with the x1
+  // structure sitting at the extrema of sin(2*pi*x1/lx) and the x3 structure following
+  // cos^2(2*pi*x3/lz) -- i.e. the quadratic response to the seed.
+  // Default false = faithful to Gill+2018 eq. (15).
+  bool seed_confine = pin->GetOrAddBoolean("problem", "seed_confine", false);
 
   // Store shared parameters for user BC and source term functions
   grav_acc   = pin->GetOrAddReal("problem", "grav", -0.1);
@@ -212,7 +222,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Real pgas = p0 * sech2;
 
     // x2-envelope: vanishes at both walls so the seed never pushes on the boundary
-    Real env = 1.0 + cos(two_pi * ny_m * x2v / ly);
+    // Gill+2018 eq. (15) envelope, or a sheet-confined one (see seed_confine above).
+    // Both vanish at the x2 walls so the seed never pushes on the boundary.
+    Real env = seed_confine ? (2.0 * sech2)
+                            : (1.0 + cos(two_pi * ny_m * x2v / ly));
 
     // ---- Velocity perturbation in the x2-direction -----------------------
     Real v2;

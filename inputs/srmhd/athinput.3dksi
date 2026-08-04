@@ -1,4 +1,4 @@
-# AthenaK input file for the 3D Kruskal-Schwarzschild Instability
+# AthenaK input file for the 3D Kruskal-Schwarzschild Instability -- CLUSTER PRODUCTION
 #
 # Same physics and equilibrium as athinput.2dksi, extended to three dimensions.
 # The current sheet lies in the x1-x3 plane at x2 = 0; gravity is along -x2 and the
@@ -15,6 +15,26 @@
 # pressure correction in the user BC keeps that from launching acoustic waves.
 #
 # Reference: Gill, Granot & Lyubarsky 2018, MNRAS 474, 3535
+#
+#=======================================================================================
+# BUILD (cluster)
+#   module load cuda openmpi cmake
+#   cmake -B build_cluster -D PROBLEM=ksi -D Athena_ENABLE_MPI=ON \
+#         -D Kokkos_ENABLE_CUDA=ON -D Kokkos_ARCH_AMPERE80=ON \
+#         -D CMAKE_CXX_COMPILER=$(pwd)/kokkos/bin/nvcc_wrapper \
+#         -D CMAKE_BUILD_TYPE=Release
+#   cmake --build build_cluster -j
+#   ( Kokkos_ARCH: AMPERE80=A100, HOPPER90=H100, VOLTA70=V100.  One MPI rank per GPU. )
+#
+# COST at the resolution below (192x384x96 = 7.08M cells, dt ~ 1.6e-4, ~1.2e5 cycles):
+#   ~3.5 GB device memory, ~8 h on a single A100, ~2 h on 4.
+#   Doubling to 16.8 cells/a (336x672x168 = 37.9M) is ~19 GB and ~75 h on one A100.
+#
+# RESOLUTION STUDY IS MANDATORY.  In ideal MHD all reconnection is numerical, so a single
+# resolution is not trustworthy by construction (Gill+2018 Fig. 10).  Run at least
+#   nx2 = 192 / 384 / 576   (4.8 / 9.6 / 14.4 cells per `a`, keeping cells isotropic)
+# and check that the growth rate and the reconnection rate converge.
+#=======================================================================================
 
 <comment>
 problem   = 3D Kruskal-Schwarzschild instability in special relativistic MHD
@@ -27,28 +47,37 @@ basename  = ksi3d
 <mesh>
 nghost    = 4              # ppmx needs 4
 
-nx1       = 224            # transverse to the sheet normal (periodic)
+# Cells are ISOTROPIC: dx1 = dx2 = dx3 = 5.208e-4, i.e. 9.6 cells per tanh scale
+# length a = 0.005 (19.2 across the full layer Delta = 0.01).  For reference the
+# validated 2D production run had 16.8 cells per a.
+nx1       = 192            # transverse to the sheet normal (periodic)
 x1min     = -0.05
 x1max     =  0.05
 ix1_bc    = periodic
 ox1_bc    = periodic
 
-nx2       = 448            # sheet normal / gravity direction (reflecting walls)
+nx2       = 384            # sheet normal / gravity direction (reflecting walls)
 x2min     = -0.1
 x2max     =  0.1
 ix2_bc    = user           # reflecting + hydrostatic pressure correction
 ox2_bc    = user
 
-nx3       = 224            # second transverse direction (periodic), B is along x3
-x3min     = -0.05
-x3max     =  0.05
+nx3       = 96             # second transverse direction (periodic); B is along x3.
+x3min     = -0.025         # Half of x1 to keep the cost down. For a transversely cubic
+x3max     =  0.025         #   box use x3 = +-0.05 with nx3 = 192 (14.2M cells).
 ix3_bc    = periodic
 ox3_bc    = periodic
 
 <meshblock>
-nx1       = 56             # 224/56 = 4
-nx2       = 56             # 448/56 = 8
-nx3       = 56             # 224/56 = 4  -> 128 MeshBlocks
+nx1       = 32             # 192/32 = 6
+nx2       = 32             # 384/32 = 12
+nx3       = 32             # 96/32  = 3   -> 216 blocks of 32768 cells
+                           # NOTE: 3 (not 2 or 4) blocks in x3 is deliberate. The seed's
+                           #   density response goes as cos^2(2*pi*x3/lz), period lz/2.
+                           #   With 2 or 4 blocks the MeshBlock period equals lz/2 or
+                           #   lz/4 and you cannot tell a physical seed harmonic from a
+                           #   block-boundary artifact. With 3 blocks (period lz/3) the
+                           #   two are distinguishable. Keep it that way when refining.
 
 <time>
 evolution  = dynamic
@@ -57,23 +86,21 @@ cfl_number = 0.3           # MUST be <= 1/3 in 3D. AthenaK sets dt = cfl*min_i(d
                            #   so for an unsplit scheme the actual Courant number is the
                            #   SUM over directions, ~cfl*ndim. The stability limit is 1,
                            #   hence cfl <= 1/2 in 2D and cfl <= 1/3 in 3D.
-                           #   Verified empirically at 96x192x48 (isotropic cells):
+                           #   Verified at 96x192x48 (isotropic cells):
                            #     cfl=0.4 -> sum 1.2 -> NaN at t~0.03
-                           #     cfl=0.3 -> sum 0.9 -> clean
-                           #   A run with dx3 = 2*dx1 survives cfl=0.4 only because the
-                           #   sum is then 0.4*2.5 = 1.0, i.e. exactly marginal. Do not
-                           #   rely on that. (The 2D input uses cfl=0.5 => sum 1.0, also
-                           #   marginal but long-validated against Athena-C.)
+                           #     cfl=0.3 -> sum 0.9 -> clean through t=20
+                           #   A grid with dx3 = 2*dx1 survives cfl=0.4 only because the
+                           #   sum is then exactly 1.0. Do not rely on that.
 nlim       = -1
 tlim       = 20.0
-ndiag      = 1
+ndiag      = 100           # keep stdout small on a batch system
 
 <coord>
 special_rel = true
 
 <mhd>
 eos         = ideal
-reconstruct = ppmx         # matches Athena-C --with-order=3p (Colella-Sekora)
+reconstruct = ppmx         # matches Athena-C --with-order=3p (Colella-Sekora limiters)
 rsolver     = hlle         # NOT hlld in 3D.  In 3D the x3 sweep solves Riemann problems
                            #   with a STRONG NORMAL field (bx = B3 ~ 3.2) through
                            #   near-pressureless gas (p ~ 1e-16, beta ~ 2e-17) -- a
@@ -85,9 +112,9 @@ rsolver     = hlle         # NOT hlld in 3D.  In 3D the x3 sweep solves Riemann 
                            #        t      HLLE std      HLLD std
                            #      0.25     3.6e-4        1.2e-1
                            #      0.50     9.6e-4        4.4e-1   (rho reaches 6.7)
-                           #   This is NOT the cfl problem above -- both runs used the
-                           #   safe cfl=0.3.  HLLD remains the correct choice in 2D,
-                           #   where it is validated bit-for-bit on the MUB shock tubes.
+                           #   This is NOT the cfl issue above -- both used cfl=0.3.
+                           #   HLLD remains correct in 2D, where it is validated
+                           #   bit-for-bit on the MUB 1-4 shock tubes.
 gamma       = 1.333333333333
 dfloor      = 1.0e-10
 pfloor      = 1.0e-18      # must stay below p0*sech^2(x2max/a) = 8.66e-17
@@ -96,37 +123,62 @@ fofc        = true
 <problem>
 user_srcs = true
 grav      = -0.1
-grav_on_enthalpy = false   # false = f = D*g (Athena-C convention); true = f = w*g (paper)
-amp       = 9.5346e-7      # kappa_v * v_A = 1e-6 * sqrt(10/11)
+grav_on_enthalpy = false   # false = f = D*g (Athena-C convention); true = f = w*g (the
+                           #   physically correct inertial force, Gill eq. 5). Setting it
+                           #   true makes growth sqrt(6) = 2.45x faster.
+amp       = 9.5346e-7      # kappa_v * v_A = 1e-6 * sqrt(10/11), the Gill fiducial.
+                           #   Use ~1e-3 ONLY for a quick morphology run: it reaches the
+                           #   nonlinear stage ~10 time units earlier but also drives the
+                           #   background to +-65% (see seed_confine below), which
+                           #   contaminates the diagnostics. Keep the fiducial for science.
 sigma     = 10.0
 delta     = 0.01           # FULL fluid-frame width of the hot layer
-a         = 0.005          # tanh scale length = delta/2 (do NOT omit)
-iprob     = 1              # 1 = single mode (Gill+2018 eq. 15), the 3D analogue of the
-                           #   2D production run and what makes the two comparable.
-                           # 2 = multimode white noise, physically the better seed for
-                           #   3D, BUT per-cell noise puts almost no power on box-scale
-                           #   modes (coherent amplitude ~ amp/sqrt(N_cells)), so with
-                           #   the Gill amplitude 9.5e-7 it stays 6 orders below the
-                           #   iprob=1 run at t=4 and never reaches the nonlinear phase
-                           #   within tlim=20.  If you want iprob=2, raise amp to ~1e-4.
-nx        = 1              # mode numbers, used by iprob=1 only
+a         = 0.005          # tanh scale length = delta/2 (do NOT omit: ksi.cpp defaults
+                           #   a = delta, which would double the sheet thickness)
+iprob     = 1              # 1 = single mode (Gill eq. 15), the 3D analogue of the 2D run
+                           #     and what makes the two directly comparable.
+                           # 2 = multimode white noise. Physically the better 3D seed,
+                           #     BUT per-cell noise puts almost no power on box-scale
+                           #     modes (coherent amplitude ~ amp/sqrt(N_cells)); with the
+                           #     Gill amplitude it stays 6 orders below iprob=1 at t=4 and
+                           #     never goes nonlinear within tlim=20. If you want iprob=2,
+                           #     raise amp to ~1e-4.
+seed_confine = false       # false = Gill's (1+cos(2*pi*ny*x2/ly)) envelope, which is
+                           #     nonzero over the WHOLE box and therefore also stirs the
+                           #     magnetized background.
+                           # true  = confine the seed to the sheet with 2*sech^2(x2/a).
+                           #     Departs from eq. (15) but perturbs only the interface.
+                           #     Turn this on if the background columns at x1 = +-lx/4
+                           #     contaminate your measurement.
+nx        = 1              # mode numbers (used by iprob=1 only)
 ny        = 1
 nz        = 1
 
+#---------------------------------------------------------------------------------------
+# OUTPUT.  Volume dumps are 142 MB (mhd_w) + 85 MB (mhd_bcc) each at this resolution, so
+# keep them coarse and use x3 slices for the movie: a slice is ~1.5 MB.
+# Totals below: ~9 GB volume + ~0.6 GB slices + ~5 GB restarts.
+#---------------------------------------------------------------------------------------
 <output1>
 file_type = hst
 dt        = 0.01
 
 <output2>
-file_type = bin            # 3D volume data; VTK would be far larger
+file_type = bin            # 3D volume, primitives
 variable  = mhd_w
-dt        = 0.25
+dt        = 0.5
 
 <output3>
-file_type = bin
+file_type = bin            # 3D volume, cell-centered B
 variable  = mhd_bcc
-dt        = 0.25
+dt        = 0.5
 
 <output4>
+file_type = bin            # x3 slice for the movie, cheap and finely sampled
+variable  = mhd_w
+slice_x3  = 0.0
+dt        = 0.05
+
+<output5>
 file_type = rst
-dt        = 1.0
+dt        = 2.0
