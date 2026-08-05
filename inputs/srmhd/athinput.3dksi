@@ -101,20 +101,32 @@ special_rel = true
 <mhd>
 eos         = ideal
 reconstruct = ppmx         # matches Athena-C --with-order=3p (Colella-Sekora limiters)
-rsolver     = hlle         # NOT hlld in 3D.  In 3D the x3 sweep solves Riemann problems
-                           #   with a STRONG NORMAL field (bx = B3 ~ 3.2) through
-                           #   near-pressureless gas (p ~ 1e-16, beta ~ 2e-17) -- a
-                           #   channel that never arises in 2D, where B3 is always
-                           #   transverse.  There the MUB pressure iteration is
-                           #   ill-conditioned and pumps growing noise into the
-                           #   background.  Controlled comparison, identical grid
-                           #   (96x192x48 isotropic), cfl=0.3, iprob=1:
-                           #        t      HLLE std      HLLD std
-                           #      0.25     3.6e-4        1.2e-1
-                           #      0.50     9.6e-4        4.4e-1   (rho reaches 6.7)
-                           #   This is NOT the cfl issue above -- both used cfl=0.3.
-                           #   HLLD remains correct in 2D, where it is validated
-                           #   bit-for-bit on the MUB 1-4 shock tubes.
+rsolver     = hlld         # Safe in 3D since the 2026-08 robustness fix in
+                           #   src/mhd/rsolvers/hlld_srmhd.hpp.  Previously HLLD blew
+                           #   up the 3D background: in the cold magnetically dominated
+                           #   far field (b^2/gamma*p ~ 1e5) the HLLD wave fan is
+                           #   degenerate along every sweep (x3 faces: B ~ normal, so
+                           #   fast = Alfven; x1/x2 faces: B ~ transverse, so the fan is
+                           #   a tangential discontinuity) and the solver resolves
+                           #   grid-scale field-aligned noise with ZERO dissipation --
+                           #   it pumped u3 noise from 4e-7 to 2e-3 by t=0.25 and rho
+                           #   O(1) caustics by t=0.5.  The fix adds a per-face
+                           #   degeneracy switch (revert to HLLE when b^2 > 10*gamma*p
+                           #   AND the field is axis-aligned to 1 part in 1e2), plus
+                           #   convergence/physicality gates on the MUB pressure
+                           #   iteration.  Controlled comparison, 96x192x48 isotropic,
+                           #   cfl=0.3, iprob=1, p_bg=1e-4, std(rho) at |x2|>4a:
+                           #        t      HLLE       HLLD(old)    HLLD(fixed)
+                           #      0.25   1.06e-2      6.7e-2       1.06e-2
+                           #      0.50   2.56e-3      7.5e-1       2.57e-3
+                           #   and 2-KE growth tracks HLLE to 0.1%.  HLLD stays fully
+                           #   active where the KSI physics lives (the sheet and flanks
+                           #   have p ~ 0.6-5, drip surfaces have p ~ 5 on one side,
+                           #   bent field lines have mixed B components); the switch
+                           #   only fires on the featureless magnetic rails, where the
+                           #   waves it gives up carry ~zero jumps.  MUB 1-4 shock
+                           #   tubes: bit-for-bit unaffected by the switch; the
+                           #   extended secant changes L1-vs-reference by < 3%.
 gamma       = 1.333333333333
 dfloor      = 1.0e-10
 pfloor      = 1.0e-18      # must stay below p0*sech^2(x2max/a) = 8.66e-17

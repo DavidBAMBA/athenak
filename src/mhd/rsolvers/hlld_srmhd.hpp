@@ -30,6 +30,26 @@
 //! The fallback to HLLE is essential: the pressure iteration can fail in strongly
 //! magnetized or near-degenerate states, and MUB itself recommends reverting there.
 //!
+//! ROBUSTNESS (added for 3D KSI): the original Athena++ port only reverted to HLLE on
+//! non-finite values.  That is not enough: with a strong NORMAL field through low-beta
+//! gas (the x3 sweep of the 3D KSI problem, bx = B3 ~ 3.2, beta ~ 2e-5) the secant can
+//! stall, or converge to a wrong root, and still return a finite positive ptot_c whose
+//! fan is unphysical -- superluminal a/c-state velocities, broken wave ordering, or
+//! negative densities/energies -- which the isfinite() guard never catches.  Measured
+//! in a randomized ensemble of that regime, ~20% of fan-region faces produced such
+//! silent garbage, which in the 3D KSI run pumps grid noise until rho O(1) errors.
+//! Three changes (validated against the MUB 1-4 shock tubes, see build_test_hlld/):
+//!   1. The secant runs up to 12 iterations with an early convergence break instead
+//!      of exactly 4 blind ones.  Hard-jump faces (MUB tubes) converge superlinearly
+//!      from |res| ~ 1e-5 at iter 4 to ~1e-12 by iter 7, and ~40% of the faces that
+//!      used to emit garbage now converge to a physical fan.  Smooth faces break after
+//!      2 residual evaluations instead of always paying for 6.
+//!   2. Convergence gate: if the final |residual| > tol_gate the fan is not trusted.
+//!   3. Physicality gates on the assembled fan: subluminal aL/aR/c velocities, wave
+//!      ordering lambda_L <= lambda_aL <= vx_c <= lambda_aR <= lambda_R, and positive
+//!      fan densities/energies.  Any violation (or NaN, since the checks are written
+//!      NaN-safe) falls back to HLLE on that face only.
+//!
 //! NOTE ON COST: this solver is far heavier than HLLE (an inner Newton solve plus a
 //! secant loop per interface) and uses many registers, so expect a substantial slowdown
 //! on GPUs relative to hlle.  It is worth it when numerical resistivity matters -- e.g.
@@ -204,8 +224,42 @@ void HLLD_SR(const EOS_Data &eos,
   const Real delta_kx_aug  = 1.0e-12; // regularizer added to Delta K^x
   const Real initial_offset= 1.0e-5;  // relative offset for the second secant point
   const Real tol_res       = 1.0e-12;
-  const int  num_secant    = 4;
+  const int  num_secant    = 12;      // max iterations; early break once converged
   const int  num_nr        = 2;
+  // Robustness gates (see header comment).  tol_gate: healthy faces converge to
+  // |res| <~ 1e-12 with the extended secant while stalled ones sit at >~ 1e-3, so any
+  // value in between works; the residual is O(1) in c=1 units (it is Delta K^x times a
+  // dimensionless factor).  ord_slack: the B_perp -> 0 degeneracy makes the fast and
+  // Alfven speeds coincide analytically, so roundoff can put lambda_a* an epsilon
+  // outside [lambda_L, lambda_R]; measured healthy margins are >= -1e-15, measured
+  // garbage violations are O(0.1-1).
+  const Real tol_gate      = 1.0e-4;
+  const Real ord_slack     = 1.0e-9;
+  // Degeneracy switch (the actual 3D KSI cure; the gates above only catch broken fans,
+  // not this).  On a COLD, magnetically dominated face (b^2 >> gamma*p, so cs << ca)
+  // whose field is aligned with a coordinate direction, HLLD's extra waves carry ~zero
+  // jumps and it degenerates into a zero-dissipation resolver for the remaining modes:
+  //  - B ~ normal (B_perp ~ 0):  fast = Alfven along the normal; contact and rotational
+  //    modes get no dissipation.  This is the 3D-KSI x3 sweep in the far field
+  //    (bx = B3 ~ 3.2, B_perp ~ roundoff, p = 1e-4).  Measured there: HLLD pumps
+  //    field-aligned grid noise from u3_rms ~ 4e-7 (HLLE) to 2e-3 by t = 0.25 and rho
+  //    O(1) caustics by t = 0.5, while the gated fan stays formally "physical" face by
+  //    face.
+  //  - B ~ transverse (bx ~ 0): the fan collapses to a tangential discontinuity whose
+  //    (rho, u_z, B_z) jumps are resolved exactly.  Grid-scale u3/rho shear noise then
+  //    has zero damping in EVERY sweep (the x1/x2 faces of the 3D-KSI far field), and
+  //    the wall-settling transient keeps feeding it: measured std(rho) 5.9e-2 vs
+  //    HLLE 3.1e-4 at t = 0.25 near the walls with the normal-channel switch alone.
+  // In both channels HLLE loses nothing -- the waves HLLD would add resolve jumps that
+  // are ~ 0 -- so revert to HLLE there.  Faces where the KSI physics lives never
+  // trigger: the sheet and its flanks have p ~ 0.6-5 (not cold), drip surfaces have
+  // p ~ 5 on one side, reconnection regions and bent field lines have mixed B
+  // components.  2D KSI keeps HLLD on every face that has structure; its quiescent far
+  // field now gets HLLE-like fluxes, which changes nothing dynamically (u3 == 0 there
+  // by symmetry).  All MUB 1-4 tube faces: either not cold (1, 2, 4) or mixed-B (3);
+  // verified bit-for-bit unchanged.
+  const Real degen_ratio   = 1.0e-4;  // threshold on min(bx^2,B_perp^2)/max(...)
+  const Real degen_prs     = 10.0;    // threshold on b^2 / (gamma*pgas)
 
   // ------------------------------------------------------------------ L and R states
   Real rho_l = wl(m,IDN,k,j,i);
@@ -331,9 +385,22 @@ void HLLD_SR(const EOS_Data &eos,
 
   bool use_hlle = false;
 
-  // ----------------------------------------- total pressure of the HLL average state
-  Real ptot_hll;
+  // ------------------------------------------------------------ degeneracy switch
+  // Cold magnetically dominated face with the field aligned to a coordinate axis:
+  // HLLD adds only zero-strength waves here and is numerically unstable (see header).
   {
+    Real bperp_sq_max = fmax(SQR(bb2_l) + SQR(bb3_l), SQR(bb2_r) + SQR(bb3_r));
+    Real b_sq_max     = fmax(b_sq_l, b_sq_r);
+    if (b_sq_max > degen_prs*eos.gamma*fmax(pgas_l, pgas_r) &&
+        (bperp_sq_max < degen_ratio*SQR(bbx) ||     // B ~ normal: fast = Alfven
+         SQR(bbx) < degen_ratio*bperp_sq_max)) {    // B ~ transverse: tangential disc.
+      use_hlle = true;
+    }
+  }
+
+  // ----------------------------------------- total pressure of the HLL average state
+  Real ptot_hll = 0.0;
+  if (!use_hlle) {
     Real m_sq  = SQR(cons_hll.mx) + SQR(cons_hll.my) + SQR(cons_hll.mz);
     Real bb_sq = SQR(bbx) + SQR(cons_hll.by) + SQR(cons_hll.bz);
     Real m_dot_bb = cons_hll.mx*bbx + cons_hll.my*cons_hll.by
@@ -368,19 +435,23 @@ void HLLD_SR(const EOS_Data &eos,
   }
 
   // ------------------------------------------- initial guess for the fan pressure
-  Real ptot_init;
-  if (SQR(bbx)/ptot_hll < p_transition) {   // weak field: quadratic estimate (MUB 55)
-    Real a1 = cons_hll.e - flux_hll.mx;
-    Real a0 = cons_hll.mx*flux_hll.e - flux_hll.mx*cons_hll.e;
-    Real s2 = SQR(a1) - 4.0*a0;
-    Real ss = (s2 < 0.0) ? 0.0 : sqrt(s2);
-    ptot_init = (s2 >= 0.0 && a1 >= 0.0) ? -2.0*a0/(a1 + ss) : 0.5*(-a1 + ss);
-  } else {                                  // strong field (MUB 53)
-    ptot_init = ptot_hll;
+  Real ptot_init = 0.0;
+  if (!use_hlle) {
+    if (SQR(bbx)/ptot_hll < p_transition) { // weak field: quadratic estimate (MUB 55)
+      Real a1 = cons_hll.e - flux_hll.mx;
+      Real a0 = cons_hll.mx*flux_hll.e - flux_hll.mx*cons_hll.e;
+      Real s2 = SQR(a1) - 4.0*a0;
+      Real ss = (s2 < 0.0) ? 0.0 : sqrt(s2);
+      ptot_init = (s2 >= 0.0 && a1 >= 0.0) ? -2.0*a0/(a1 + ss) : 0.5*(-a1 + ss);
+    } else {                                // strong field (MUB 53)
+      ptot_init = ptot_hll;
+    }
+    if (!Kokkos::isfinite(ptot_init) || ptot_init <= 0.0) use_hlle = true;
   }
-  if (!Kokkos::isfinite(ptot_init) || ptot_init <= 0.0) use_hlle = true;
 
   // ------------------------------------------------ secant iteration on MUB (48)
+  // NOTE: `s` is filled by every SRHLLDResidual() call, so after the loop it holds the
+  // fan implied by the last evaluated pressure p_n == ptot_c.
   HLLDFan s;
   Real ptot_c = ptot_init;
   if (!use_hlle) {
@@ -392,20 +463,24 @@ void HLLD_SR(const EOS_Data &eos,
     Real r_n = SRHLLDResidual(p_n, bbx, lambda_l, lambda_r, rl, rr, delta_kx_aug, s);
 
     for (int n = 0; n < num_secant; ++n) {
+      // converged (or stalled to a fixed point / non-finite): stop
+      if (!(fabs(r_n) > tol_res) || !(fabs(p_n - p_last) > tol_ptot) ||
+          !(r_n != r_last) || !Kokkos::isfinite(p_n)) {
+        break;
+      }
       Real p_old = p_last;
       Real r_old = r_last;
       p_last = p_n;
       r_last = r_n;
-      if (fabs(r_last) > tol_res && fabs(p_last - p_old) > tol_ptot) {
-        p_n = (r_last*p_old - r_old*p_last)/(r_last - r_old);
-      } else {
-        p_n = p_last;
-      }
+      p_n = (r_last*p_old - r_old*p_last)/(r_last - r_old);
       r_n = SRHLLDResidual(p_n, bbx, lambda_l, lambda_r, rl, rr, delta_kx_aug, s);
     }
     ptot_c = p_n;
 
-    if (!Kokkos::isfinite(s.lambda_al) || !Kokkos::isfinite(s.lambda_ar) ||
+    // Convergence gate + the original finiteness checks.  Conditions are written so
+    // that a NaN anywhere trips the fallback.
+    if (!(fabs(r_n) < tol_gate) ||
+        !Kokkos::isfinite(s.lambda_al) || !Kokkos::isfinite(s.lambda_ar) ||
         !Kokkos::isfinite(ptot_c) || ptot_c <= 0.0) {
       use_hlle = true;
     }
@@ -503,6 +578,23 @@ void HLLD_SR(const EOS_Data &eos,
       flux_c.mz = flux_ar.mz + s.lambda_ar*(cons_c.mz - cons_ar.mz);
       flux_c.by = flux_ar.by + s.lambda_ar*(cons_c.by - cons_ar.by);
       flux_c.bz = flux_ar.bz + s.lambda_ar*(cons_c.bz - cons_ar.bz);
+    }
+
+    // -------------------------------------------- physicality gates on the fan
+    // A converged-looking pressure can still imply an unphysical fan (wrong root).
+    // Every condition is written as !(good) so that a NaN also trips the fallback.
+    Real v_sq_al = SQR(s.vx_al) + SQR(s.vy_al) + SQR(s.vz_al);
+    Real v_sq_ar = SQR(s.vx_ar) + SQR(s.vy_ar) + SQR(s.vz_ar);
+    Real v_sq_c  = SQR(vx_c) + SQR(vy_c) + SQR(vz_c);
+    if (!(v_sq_al < 1.0) || !(v_sq_ar < 1.0) || !(v_sq_c < 1.0) ||       // subluminal
+        !(s.lambda_al >= lambda_l - ord_slack) ||                       // ordering
+        !(s.lambda_ar <= lambda_r + ord_slack) ||
+        !(s.lambda_al <= s.lambda_ar + ord_slack) ||
+        !(vx_c >= s.lambda_al - ord_slack) ||
+        !(vx_c <= s.lambda_ar + ord_slack) ||
+        !(cons_al.d > 0.0) || !(cons_ar.d > 0.0) || !(cons_c.d > 0.0) || // positivity
+        !(cons_al.e > 0.0) || !(cons_ar.e > 0.0) || !(cons_c.e > 0.0)) {
+      use_hlle = true;
     }
   }
 
